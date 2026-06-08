@@ -6,18 +6,28 @@ Stack EDS element maps (TIFF) into a false-colour composite.
 
 ### 1. Install `uv`
 
-`uv` is a single-binary Python installer; it pulls in the right Python version automatically.
+`uv` is a single-binary Python installer; it pulls in the right Python version automatically. 
+This step is optional, but it will make things run more smoothly if you don't want to install dependencies manually.
 
 - **macOS / Linux**
   ```sh
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
+  or...
+- ```sh
+  brew install uv
+  ```
+
 - **Windows (PowerShell)**
   ```powershell
   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
   ```
 
-Restart your shell (or `source $HOME/.local/bin/env` on Unix) so `uv` is on `PATH`. I suggest Googling `uv` before installing to make sure this download path is up to date. `Homebrew` is likely the easiest option for installation if you are on macOS and you have it installed.
+Restart your shell (or `source $HOME/.local/bin/env` on Unix) so `uv` is on `PATH`. 
+
+Here is the website with `uv` documentation: https://docs.astral.sh/uv/getting-started/installation/ 
+
+`Homebrew` is likely the easiest option for installing `uv` if you are on macOS.
 
 ### 2. Install the app
 
@@ -47,7 +57,9 @@ From anywhere:
 stackEDS-TW
 ```
 
-A folder picker opens — choose a directory containing your `.tif` element maps and the stacker launches.
+A folder picker opens — choose a directory containing your `.tif` element maps and the stacker launches. 
+*Currently* it requires the maps to be in the form "[element].tiff", where [element] is fixed as 
+Al, Ca, Cr, Fe, K, Mg, Si, and Ti. If you have the editable version, you can harcode any change manually.
 
 ## Update / uninstall
 

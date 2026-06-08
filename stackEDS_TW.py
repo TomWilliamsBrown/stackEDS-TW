@@ -27,9 +27,7 @@ from PyQt5.QtWidgets import (
 
 # ---------------- CONFIG ---------------- #
 
-# Where the directory picker opens by default. The viewer no longer reads from
-# here directly; the folder is chosen at startup. 
-# Set as "" to start from the home directory.
+# Where the directory picker opens by default.
 DEFAULT_IMAGE_DIR = ""
 
 
@@ -53,7 +51,9 @@ class Element:
         """Colour as an RGB array normalised to [0, 1]."""
         return np.array(ImageColor.getrgb(self.colour), dtype=np.float32) / 255.0
 
-
+# Here I am using Katie and Josh's preferred colour scheme.
+# The file for each element is currently just its chemical symbol, with fixed elements.
+# TODO: Adjust so user can enter their own file format/element without needing to hardcode here.
 ELEMENTS = [
     Element("Al", "white", brightness=5, smoothing=2),
     Element("Ca", "yellow", brightness=5, smoothing=2),
@@ -745,7 +745,7 @@ class Viewer(QWidget):
         print("Generating full resolution images...")
         # Each used element's colour map is always saved individually. The
         # combined image sums only the elements toggled on, and its filename
-        # lists just those.
+        # lists them.
         combined = None
         combined_names = []
         for (full, rgb), w in zip(self.full_data, self.elements):
@@ -838,11 +838,13 @@ class Viewer(QWidget):
 def main():
     app = QApplication(sys.argv)
 
-    # Ask the user which folder holds the element maps. Re-prompt if the chosen
-    # folder has no usable TIFFs; exit quietly if they cancel.
+    # Prompt to select the directory containing the EDS maps
     start = DEFAULT_IMAGE_DIR if DEFAULT_IMAGE_DIR and os.path.isdir(DEFAULT_IMAGE_DIR) \
         else os.path.expanduser("~")
 
+    QMessageBox.information(
+        None, "Select folder",
+        "Choose the folder containing the element maps (.tif).")
     viewer = None
     while viewer is None:
         image_dir = QFileDialog.getExistingDirectory(
@@ -853,7 +855,7 @@ def main():
             viewer = Viewer(image_dir)
         except RuntimeError as e:
             QMessageBox.warning(None, "No element maps found", str(e))
-            start = image_dir  # reopen near their last choice
+            start = image_dir
 
     viewer.show()
     sys.exit(app.exec_())
