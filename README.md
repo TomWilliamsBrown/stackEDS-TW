@@ -21,10 +21,20 @@ Restart your shell (or `source $HOME/.local/bin/env` on Unix) so `uv` is on `PAT
 
 ### 2. Install the app
 
-From inside the directory run the command:
+If you want to be able to edit the code locally, clone the repo first, then install in editable mode from inside the directory:
 
 ```sh
-uv tool install .
+git clone https://github.com/TomWilliamsBrown/stackEDS-TW.git
+cd stackEDS-TW
+uv tool install --editable .
+```
+
+This will mean that the `stackEDS-TW` command points directly at the source file on your system.
+
+If you just want to keep up with whatever is on github, install from anywhere with:
+
+```sh
+uv tool install git+https://github.com/TomWilliamsBrown/stackEDS-TW.git
 ```
 
 `uv` will create an isolated environment, install the dependencies (`opencv-python`, `numpy`, `tifffile`, `Pillow`, `PyQt5`, `imagecodecs`), and put a `stackEDS-TW` command on your `PATH`.
@@ -41,17 +51,8 @@ A folder picker opens — choose a directory containing your `.tif` element maps
 
 ## Update / uninstall
 
+Running `upgrade` will fetch the latest version from github.
 ```sh
 uv tool upgrade stackEDS-TW
 uv tool uninstall stackEDS-TW
 ```
-
-## Editing the code
-
-If you want to edit the code for your uses, installing as:
-
-```sh
-uv tool install --editable .
-```
-
-Means the  `stackEDS-TW` command points directly at the source file.
