@@ -6,6 +6,7 @@ Each element has an adjustable processing pipeline:
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
@@ -636,6 +637,9 @@ def resolve_filenames(image_dir, names):
         return ("default", default)
 
     # 2) Otherwise look for a consistent prefix/suffix wrapped around symbols.
+    #    Prefix must match exactly across elements. Suffix is normalised so that
+    #    EDS line-family letters (K/L/M, e.g. "_K_alpha" vs "_L_alpha") and a
+    #    trailing numeric tail (e.g. "_1" or "_1,2") are treated as equivalent.
     candidates = {}
     for name in names:
         for stem, f in stems:
@@ -644,24 +648,40 @@ def resolve_filenames(image_dir, names):
                 idx = stem.find(name, start)
                 if idx < 0:
                     break
-                affix = (stem[:idx], stem[idx + len(name):])
-                candidates.setdefault(affix, {}).setdefault(name, f)
+                prefix = stem[:idx]
+                suffix = stem[idx + len(name):]
+                key = (prefix, _normalise_suffix(suffix))
+                candidates.setdefault(key, {}).setdefault(name, f)
                 start = idx + 1
 
     best = None
-    for (prefix, suffix), matched in candidates.items():
+    for (prefix, norm_suffix), matched in candidates.items():
         # The same pattern must hold for at least two elements
         if len(matched) < 2:
             continue
         # Most elements wins; then prefer the simplest (shortest) affixes;
         # finally fall back to lexicographic order so the choice is stable.
-        key = (len(matched), -(len(prefix) + len(suffix)), prefix, suffix)
+        key = (len(matched), -(len(prefix) + len(norm_suffix)), prefix, norm_suffix)
         if best is None or key > best[0]:
-            best = (key, prefix, suffix, matched)
+            best = (key, prefix, norm_suffix, matched)
 
     if best is None:
         return ("none", {})
     return ("alternative", best[3], best[1], best[2])
+
+
+_LINE_LETTER_RE = re.compile(r"(?<![A-Za-z])[KLM](?![A-Za-z])")
+_TRAILING_NUM_RE = re.compile(r"_\d+(?:,\d+)*$")
+
+
+def _normalise_suffix(suffix):
+    """Collapse the parts of a suffix that are allowed to vary per element.
+
+    inc. X-ray emission line in the filenams
+    """
+    s = _TRAILING_NUM_RE.sub("", suffix)
+    s = _LINE_LETTER_RE.sub("<line>", s)
+    return s
 
 
 # ---------- GUI: COMBINED VIEW ---------- #
