@@ -4,9 +4,6 @@ Each element has an adjustable processing pipeline:
     smooth -> black level -> gamma -> brightness (gain) -> colour
 """
 
-#TODO: Autobrightness/contrast?
-#TODO: Add white level in addition to black level (or just replace with contrast?)
-
 import json
 import os
 import sys
@@ -40,6 +37,7 @@ class Element:
     brightness: float = 5.0  # gain
     smoothing: float = 2.0  # Gaussian sigma (full-res pixels)
     black: float = 0.0  # black-level threshold, [0, 1]
+    white: float = 1.0  # white-level threshold, [0, 1]
     gamma: float = 1.0  # contrast curve
     filename: str = ""  # defaults to `name` (i.e. "<name>.tif")
 
@@ -57,14 +55,14 @@ class Element:
 # TODO: Adjust so user can enter their own file format/element without needing to
 # hardcode it or use the current fail fallback.
 ELEMENTS = [
-    Element("Al", "white", brightness=5, smoothing=2),
-    Element("Ca", "yellow", brightness=5, smoothing=2),
-    Element("Cr", "orange", brightness=5, smoothing=2),
-    Element("Fe", "red", brightness=5, smoothing=2),
-    Element("K", "cyan", brightness=10, smoothing=2),
-    Element("Mg", "green", brightness=10, smoothing=2),
-    Element("Si", "blue", brightness=5, smoothing=2),
-    Element("Ti", "magenta", brightness=5, smoothing=2),
+    Element("Al", "white", brightness=5, smoothing=1),
+    Element("Ca", "yellow", brightness=5, smoothing=1),
+    Element("Cr", "orange", brightness=5, smoothing=1),
+    Element("Fe", "red", brightness=5, smoothing=1),
+    Element("K", "cyan", brightness=5, smoothing=1),
+    Element("Mg", "green", brightness=5, smoothing=1),
+    Element("Si", "blue", brightness=5, smoothing=1),
+    Element("Ti", "magenta", brightness=5, smoothing=1),
 ]
 
 PREVIEW_SCALE = 0.25  # downsample factor for the per-element thumbnails
@@ -77,7 +75,7 @@ TITLE_H = 22  # px, element/combined title height (kept equal so the
 #     big preview's top lines up with the thumbnails)
 COMBINED_MIN = 420  # px, minimum side of the (responsive) combined preview
 HIST_W = PREVIEW_SIZE  # px, histogram width
-HIST_H = 26  # px, histogram height
+HIST_H = 20  # px, histogram height
 EXPORT_MAX = 65535  # 16-bit TIFF export range
 
 # adjustable-control ranges
@@ -102,7 +100,10 @@ FIELD_BG = "#26282d"
 FIELD_BORDER = "#34373d"
 ACCENT = "#4a9eff"
 TEXT = "#e6e6e8"
-TEXT_MUTED = "#9a9ba0"
+TEXT_MUTED = "#a6a6a6"
+
+# 0 = invisible, 1 = solid. Controls text/border transparency on missing-file cards.
+MISSING_ALPHA = 0.40
 
 STYLESHEET = f"""
 QWidget#viewer {{
@@ -188,6 +189,13 @@ def _hex(rgb):
     return "#%02x%02x%02x" % tuple(int(round(max(0.0, min(1.0, c)) * 255)) for c in rgb)
 
 
+def _rgba(hex_color, alpha):
+    """'#rrggbb' + alpha float -> 'rgba(r, g, b, a)' for Qt stylesheets."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
 def title_colour(rgb):
     """Brighten an element's colour just enough to read on the dark cards.
     The true colour still shows in the small swatch; this is only for the text.
@@ -242,9 +250,9 @@ def smooth(gray, sigma, scale=1.0):
     return cv2.GaussianBlur(gray, (0, 0), s) if s > 0 else gray
 
 
-def tonemap(gray, black, gamma):
-    """Apply black-level threshold then gamma; result stays in [0, 1]."""
-    g = np.clip((gray - black) / max(1.0 - black, 1e-6), 0, 1)
+def tonemap(gray, black, white, gamma):
+    """Stretch [black, white] to [0, 1] then apply gamma."""
+    g = np.clip((gray - black) / max(white - black, 1e-6), 0, 1)
     return g ** gamma if gamma != 1.0 else g
 
 
@@ -257,14 +265,14 @@ def render_layer(src, w, scale):
     """Run a source map through one element's full pipeline -> colour layer.
     `scale` is the source's downsample factor vs full-res
     """
-    gray = tonemap(smooth(src, w.smoothing, scale), w.black, w.gamma)
+    gray = tonemap(smooth(src, w.smoothing, scale), w.black, w.white, w.gamma)
     return colorize(gray, w.rgb, w.brightness)
 
 
-def histogram_image(gray, black, colour=None, bins=64, width=HIST_W, height=HIST_H):
-    """Render a log-scaled intensity histogram with a black-level marker.
-    Bars are tinted with the element's colour (dimmed); the threshold marker is
-    a bright vertical line.
+def histogram_image(gray, black, white, colour=None, bins=64, width=HIST_W, height=HIST_H):
+    """Render a log-scaled intensity histogram with black and white markers.
+    Bars are tinted with the element's colour (dimmed); the threshold markers
+    are bright vertical lines (black = red-orange, white = pale blue).
     """
     counts, _ = np.histogram(gray, bins=bins, range=(0.0, 1.0))
     counts = np.log1p(counts.astype(np.float32))
@@ -281,8 +289,8 @@ def histogram_image(gray, black, colour=None, bins=64, width=HIST_W, height=HIST
             x1 = int((i + 1) * width / bins)
             img[height - h:height, x0:x1, :] = bar
 
-    x = int(np.clip(black, 0, 1) * (width - 1))  # threshold marker
-    img[:, x, :] = (1.0, 0.25, 0.2)
+    img[:, int(np.clip(black, 0, 1) * (width - 1)), :] = (1.0, 0.25, 0.2)
+    img[:, int(np.clip(white, 0, 1) * (width - 1)), :] = (0.65, 0.8, 1.0)
     return img
 
 
@@ -373,7 +381,7 @@ class Control(QWidget):
 # ---------- GUI: PER-ELEMENT PANEL ------ #
 
 class ElementWidget(QFrame):
-    def __init__(self, element, preview_img, combined_img, viewer):
+    def __init__(self, element, preview_img, combined_img, viewer, available=True):
         super().__init__()
         self.setObjectName("card")
         self.setFixedWidth(CARD_WIDTH)
@@ -382,6 +390,7 @@ class ElementWidget(QFrame):
         self.preview_img = preview_img
         self.combined_img = combined_img
         self.rgb = element.rgb
+        self.available = available
 
         # Caches so edits don't redo work (might mean computers with little RAM struggle on large files?):
         #   _sm_*     : the Gaussian-blurred map, kept until `smoothing` changes
@@ -435,15 +444,16 @@ class ElementWidget(QFrame):
         refresh = self.notify_change
         self.brightness_c = Control("Brightness", 0.0, BRIGHTNESS_MAX, element.brightness, refresh)
         self.black_c = Control("Black level", 0.0, 1.0, element.black, refresh)
+        self.white_c = Control("White level", 0.0, 1.0, element.white, refresh)
         self.gamma_c = Control("Gamma", GAMMA_MIN, GAMMA_MAX, element.gamma, refresh)
         self.smooth_c = Control("Smoothing", 0.0, MAX_SMOOTHING, element.smoothing, refresh, fmt="{:.1f}")
-        self.controls = [self.brightness_c, self.black_c, self.gamma_c, self.smooth_c]
+        self.controls = [self.brightness_c, self.black_c, self.white_c, self.gamma_c, self.smooth_c]
 
-        reset_btn = QPushButton("Reset")
-        reset_btn.clicked.connect(self.reset)
+        self.reset_btn = QPushButton("Reset")
+        self.reset_btn.clicked.connect(self.reset)
 
         layout = QVBoxLayout()
-        layout.setSpacing(6)
+        layout.setSpacing(4)
         layout.setContentsMargins(CARD_PAD, CARD_PAD, CARD_PAD, CARD_PAD)
         layout.addWidget(title_row)
         layout.addWidget(self.thumb, alignment=Qt.AlignCenter)
@@ -452,8 +462,20 @@ class ElementWidget(QFrame):
         for c in self.controls:
             layout.addWidget(c)
         layout.addSpacing(2)
-        layout.addWidget(reset_btn)
+        layout.addWidget(self.reset_btn)
         self.setLayout(layout)
+
+        if not self.available:
+            self.include_btn.blockSignals(True)
+            self.include_btn.setChecked(False)
+            self.include_btn.blockSignals(False)
+            self.include_btn.setEnabled(False)
+            self.include_btn.setToolTip(
+                f"{element.name}.tif not found in the chosen folder")
+            for c in self.controls:
+                c.setEnabled(False)
+            self.reset_btn.setEnabled(False)
+            self._apply_included_style()
 
     # current values
     @property
@@ -463,6 +485,10 @@ class ElementWidget(QFrame):
     @property
     def black(self):
         return self.black_c.value()
+
+    @property
+    def white(self):
+        return self.white_c.value()
 
     @property
     def gamma(self):
@@ -497,15 +523,17 @@ class ElementWidget(QFrame):
 
     def recompute(self):
         """Refresh this element's thumbnail, histogram and cached layer."""
+        if not self.available:
+            return
         sm_p = self.smoothed_preview()
-        gray = tonemap(sm_p, self.black, self.gamma)
+        gray = tonemap(sm_p, self.black, self.white, self.gamma)
         self._thumb_rgb = colorize(gray, self.rgb, self.brightness)
         self._render_thumb()
         self.hist.setPixmap(QPixmap.fromImage(
-            to_qimage(histogram_image(sm_p, self.black, self.rgb))))
+            to_qimage(histogram_image(sm_p, self.black, self.white, self.rgb))))
 
         sm_c = self.smoothed_combined()
-        gray_c = tonemap(sm_c, self.black, self.gamma)
+        gray_c = tonemap(sm_c, self.black, self.white, self.gamma)
         self._layer = colorize(gray_c, self.rgb, self.brightness)
 
     def _render_thumb(self):
@@ -528,7 +556,9 @@ class ElementWidget(QFrame):
         self.viewer.refresh_combined()
 
     def _apply_included_style(self):
-        """Brighten the title when included; dim it when excluded."""
+        """Brighten the title when included; dim it when excluded.
+        Cards for missing files get an extra faded card/well treatment.
+        """
         if self.included:
             self.swatch.setStyleSheet(
                 f"background: {self._swatch_on}; border-radius: 2px;")
@@ -539,6 +569,27 @@ class ElementWidget(QFrame):
                 f"background: {BORDER_HOVER}; border-radius: 2px;")
             self.name_label.setStyleSheet(
                 f"color: {TEXT_MUTED}; font-weight: 600;")
+
+        if not self.available:
+            # Fade every widget if the element isn't found
+            muted_text = _rgba(TEXT_MUTED, MISSING_ALPHA)
+            muted_border = _rgba(BORDER, MISSING_ALPHA)
+            muted_field = _rgba(BG_WINDOW, MISSING_ALPHA)
+            self.setStyleSheet(
+                f"QFrame#card {{ background: {BG_WINDOW};"
+                f" border: 1px solid {BORDER}; border-radius: 12px; }}"
+                f" QLabel#thumb, QLabel#hist {{ background: {BG_WINDOW};"
+                f" border: 1px solid {BORDER}; border-radius: 8px; }}"
+                f" QLabel {{ color: {muted_text}; }}"
+                f" QLineEdit {{ color: {muted_text}; background: {muted_field};"
+                f" border: 1px solid {muted_border}; border-radius: 7px;"
+                f" padding: 3px 8px; }}"
+                f" QPushButton {{ color: {muted_text}; background: {muted_field};"
+                f" border: 1px solid {muted_border}; border-radius: 8px;"
+                f" padding: 6px 12px; }}"
+                f" QPushButton#toggle {{ background: transparent;"
+                f" color: {muted_text}; border: 1px solid {muted_border};"
+                f" border-radius: 5px; padding: 0; }}")
 
     def reset(self):
         for c in self.controls:
@@ -927,7 +978,8 @@ class Viewer(QWidget):
             raise RuntimeError("No TIFF files found in directory.")
 
         for i, el in enumerate(ELEMENTS):
-            if el.name in maps:
+            available = el.name in maps
+            if available:
                 full, preview, combined = maps[el.name]
                 full = full[:ref[0], :ref[1]]
                 preview = preview[:ref_preview[0], :ref_preview[1]]
@@ -939,7 +991,7 @@ class Viewer(QWidget):
                 preview = np.zeros(ref_preview, dtype=np.float32)
                 combined = np.zeros(ref_combined, dtype=np.float32)
 
-            widget = ElementWidget(el, preview, combined, self)
+            widget = ElementWidget(el, preview, combined, self, available=available)
             self.grid.addWidget(widget, i // GRID_COLUMNS, i % GRID_COLUMNS,
                                 alignment=Qt.AlignTop)
             self.elements.append(widget)
@@ -1087,6 +1139,7 @@ class Viewer(QWidget):
                 "colour": _hex(w.rgb),
                 "brightness": w.brightness,
                 "black": w.black,
+                "white": w.white,
                 "gamma": w.gamma,
                 "smoothing": w.smoothing,
                 "included": w.included,
@@ -1123,8 +1176,11 @@ class Viewer(QWidget):
             saved_colour = entry.get("colour")
             if saved_colour and saved_colour.lower() != _hex(w.rgb).lower():
                 colour_mismatches.append(f"{w.name}: {saved_colour} vs {_hex(w.rgb)}")
+            if not w.available:
+                continue
             w.brightness_c.set_value(float(entry.get("brightness", w.brightness)))
             w.black_c.set_value(float(entry.get("black", w.black)))
+            w.white_c.set_value(float(entry.get("white", w.white)))
             w.gamma_c.set_value(float(entry.get("gamma", w.gamma)))
             w.smooth_c.set_value(float(entry.get("smoothing", w.smoothing)))
             w.include_btn.blockSignals(True)
