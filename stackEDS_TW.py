@@ -2,9 +2,11 @@
 
 Each element has an adjustable processing pipeline:
     smooth -> black level -> gamma -> brightness (gain) -> colour
-plus a small histogram showing where the black-level threshold sits.
-The colourised maps are summed into a live preview and exported full-res.
 """
+
+#TODO: Allow zooming into and panning around the tiles
+#TODO: Autobrightness/contrast?
+#TODO: Add white level in addition to black level (or just replace with contrast?)
 
 import json
 import os
@@ -53,7 +55,8 @@ class Element:
 
 # Here I am using Katie and Josh's preferred colour scheme.
 # The file for each element is currently just its chemical symbol, with fixed elements.
-# TODO: Adjust so user can enter their own file format/element without needing to hardcode here.
+# TODO: Adjust so user can enter their own file format/element without needing to
+# hardcode it or use the current fail fallback.
 ELEMENTS = [
     Element("Al", "white", brightness=5, smoothing=2),
     Element("Ca", "yellow", brightness=5, smoothing=2),
@@ -187,7 +190,9 @@ def title_colour(rgb):
     The true colour still shows in the small swatch; this is only for the text.
     """
     r, g, b = (float(c) for c in rgb)
-    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    lum = 0.2126 * r + 0.7154 * g + 0.0721 * b
+    # (This uses RGB weighting from:
+    # https://scikit-image.org/docs/stable/auto_examples/color_exposure/plot_rgb_to_gray.html
     target = 0.66
     if lum < target:
         t = max(0.0, min((target - lum) / (1.0 - lum if lum < 1.0 else 1.0), 0.72))
@@ -512,6 +517,73 @@ class ElementWidget(QFrame):
         self.notify_change()
 
 
+# ---------- FILE DISCOVERY -------------- #
+
+def resolve_filenames(image_dir, names):
+    """Work out which on-disk TIFF map to use for each element symbol.
+
+    Preference order:
+      1. The default "<symbol>.tif" naming (e.g. "Al.tif").
+      2. A single pattern that wraps the same text before and/or
+         after every symbol, e.g. "User1-Al_K.tif" / "User1-Ca_K.tif".
+
+     Using (2) because the default AZtec naming convention is different to my archiving.
+
+    Returns one of:
+      ("default",     {symbol: filename})
+      ("alternative", {symbol: filename}, prefix, suffix)
+      ("none",        {})
+
+    """
+    try:
+        entries = os.listdir(image_dir)
+    except OSError:
+        return ("none", {})
+
+    # (stem, filename) for every TIFF, where stem is the name minus extension.
+    stems = []
+    for f in entries:
+        root, ext = os.path.splitext(f)
+        if ext.lower() in (".tif", ".tiff"):
+            stems.append((root, f))
+
+    # 1) Default: a file whose stem is exactly the symbol.
+    stem_to_file = {}
+    for stem, f in stems:
+        stem_to_file.setdefault(stem, f)
+    default = {name: stem_to_file[name] for name in names if name in stem_to_file}
+    if default:
+        return ("default", default)
+
+    # 2) Otherwise look for a consistent prefix/suffix wrapped around symbols.
+    candidates = {}
+    for name in names:
+        for stem, f in stems:
+            start = 0
+            while True:
+                idx = stem.find(name, start)
+                if idx < 0:
+                    break
+                affix = (stem[:idx], stem[idx + len(name):])
+                candidates.setdefault(affix, {}).setdefault(name, f)
+                start = idx + 1
+
+    best = None
+    for (prefix, suffix), matched in candidates.items():
+        # The same pattern must hold for at least two elements
+        if len(matched) < 2:
+            continue
+        # Most elements wins; then prefer the simplest (shortest) affixes;
+        # finally fall back to lexicographic order so the choice is stable.
+        key = (len(matched), -(len(prefix) + len(suffix)), prefix, suffix)
+        if best is None or key > best[0]:
+            best = (key, prefix, suffix, matched)
+
+    if best is None:
+        return ("none", {})
+    return ("alternative", best[3], best[1], best[2])
+
+
 # ---------- GUI: MAIN WINDOW ------------ #
 
 class Viewer(QWidget):
@@ -528,7 +600,7 @@ class Viewer(QWidget):
         self._load_data()
 
     def _init_ui(self):
-        # --- left: 4-wide grid of element cards ---
+        # --- left: 4x2 grid of element cards ---
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(14)
         self.grid.setVerticalSpacing(14)
@@ -547,8 +619,7 @@ class Viewer(QWidget):
         combined_title.setFixedHeight(TITLE_H)
         combined_title.setStyleSheet(f"color: {TEXT}; font-weight: 600;")
 
-        # Global brightness-factor nudge: multiplies every element's brightness
-        # by the entered proportion, then snaps back to 1.0 ready for the next.
+        # Global brightness-factor nudge: multiplies every element's brightness:
         # New Brightness = Current Brightness * Brightness factor
         factor_label = QLabel("Brightness factor")
         self.factor_box = QLineEdit("1.0")
@@ -610,7 +681,7 @@ class Viewer(QWidget):
         self.setWindowTitle("Element Map Viewer")
 
     def _finalise_size(self):
-        """Size the window to the real card height so all 8 cards show at once."""
+        """Size the window so that all cards show at once."""
         self.grid.activate()
         self.adjustSize()  # fit height to the (tall) grid
         h = self.height()
@@ -618,16 +689,60 @@ class Viewer(QWidget):
         self.setMinimumSize(min_w, h)  # never shrink enough to hide a row
         self.resize(min_w + 220, h)  # a little extra width for the preview
 
+    def _resolve_naming(self):
+        """Pick the on-disk filename for each element.
+
+        Uses the default "<symbol>.tif" naming when present. If not, and a
+        consistent prefix/suffix pattern is detected, ask the user whether to
+        use it instead.
+        """
+        names = [el.name for el in ELEMENTS]
+        result = resolve_filenames(self.image_dir, names)
+        kind = result[0]
+
+        if kind == "default":
+            return result[1]
+
+        if kind == "alternative":
+            mapping, prefix, suffix = result[1], result[2], result[3]
+            lines = "\n".join(f"    {name}:  {mapping[name]}"
+                              for name in names if name in mapping)
+            pattern = f'"{prefix}<element>{suffix}"'
+            msg = (
+                'No files named "<element>.tif" (e.g. "Al.tif") were found.\n\n'
+                f'However, maps using the naming pattern {pattern} '
+                'were detected:\n\n'
+                f'{lines}\n\n'
+                'Do you want to use these files?'
+            )
+            reply = QMessageBox.question(
+                self, "Use detected file names?", msg,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                return mapping
+            raise RuntimeError(
+                'File names were not confirmed.\n\n'
+                'Choose a different folder/rename your maps to "<element>.tif" (e.g. "Al.tif")'
+                '/hardcode a new file format in this python script.')
+
+        raise RuntimeError(
+            'No element maps found.\n\n'
+            'Expected files to be named "<element>.tif" (e.g. "Al.tif", "Ca.tif") \n\n'
+            'Or even for there to a set of files that all share the same text before/after the '
+            'element symbol (e.g. "User1-Al_K.tif", "User1-Ca_K.tif").')
+
     def _load_data(self):
         # Load every available map once; the first found defines the reference
         # shapes that the others are cropped to. Two downsampled copies are
         # kept: a small one for thumbnails and a larger one for the combined.
+        filenames = self._resolve_naming()  # {symbol: filename}; may prompt/raise
         maps = {}
         ref = ref_preview = ref_combined = None
         for el in ELEMENTS:
-            path = os.path.join(self.image_dir, f"{el.filename}.tif")
-            if not os.path.exists(path):
+            fname = filenames.get(el.name)
+            if not fname:
                 continue
+            path = os.path.join(self.image_dir, fname)
             full = load_and_preprocess(path)
             maps[el.name] = (full,
                              downsample(full, PREVIEW_SCALE),
@@ -681,8 +796,9 @@ class Viewer(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         # The preview label only gets its final size after the first layout
-        # pass. Defer one event-loop tick so the initial combined image scales
+        # pass. So need to defer one event-loop tick so the initial combined image scales
         # to the right size instead of a pre-layout default.
+        # TODO: Probably a more efficient way to do this?
         QTimer.singleShot(0, self._render_combined)
 
     def update_display(self):
@@ -743,9 +859,9 @@ class Viewer(QWidget):
         save_dir = Path(save_dir)
 
         print("Generating full resolution images...")
-        # Each used element's colour map is always saved individually. The
-        # combined image sums only the elements toggled on, and its filename
-        # lists them.
+        # Each used element's colour map is saved individually. The
+        # combined image sums the elements toggled on, and its filename
+        # lists the included elements.
         combined = None
         combined_names = []
         for (full, rgb), w in zip(self.full_data, self.elements):
