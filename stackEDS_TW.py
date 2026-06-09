@@ -4,7 +4,6 @@ Each element has an adjustable processing pipeline:
     smooth -> black level -> gamma -> brightness (gain) -> colour
 """
 
-#TODO: Allow zooming into and panning around the tiles
 #TODO: Autobrightness/contrast?
 #TODO: Add white level in addition to black level (or just replace with contrast?)
 
@@ -85,6 +84,10 @@ EXPORT_MAX = 65535  # 16-bit TIFF export range
 BRIGHTNESS_MAX = 100.0
 MAX_SMOOTHING = 10.0
 GAMMA_MIN, GAMMA_MAX = 0.2, 5.0
+
+# Zoom/pan: smallest fraction of the image that can fill the view
+MIN_ROI_SPAN = 0.01
+ZOOM_STEP = 1.2
 
 # ---------------- THEME ----------------- #
 # This is a Qt Style Sheet. It only restyles widgets; none
@@ -283,6 +286,19 @@ def histogram_image(gray, black, colour=None, bins=64, width=HIST_W, height=HIST
     return img
 
 
+def crop_to_roi(img, roi):
+    """Slice a 2D or 3D image to a normalised ROI = (x0, y0, x1, y1) in [0, 1].
+    Each output dimension is guaranteed to be at least one pixel.
+    """
+    x0, y0, x1, y1 = roi
+    h, w = img.shape[:2]
+    i0 = max(0, min(h - 1, int(round(y0 * h))))
+    i1 = max(i0 + 1, min(h, int(round(y1 * h))))
+    j0 = max(0, min(w - 1, int(round(x0 * w))))
+    j1 = max(j0 + 1, min(w, int(round(x1 * w))))
+    return img[i0:i1, j0:j1]
+
+
 def to_qimage(img):
     """Convert a float RGB image in [0, 1] to a QImage.
     The QImage shares `img8`'s buffer; callers copy it (via QPixmap.fromImage)
@@ -368,11 +384,14 @@ class ElementWidget(QFrame):
         self.rgb = element.rgb
 
         # Caches so edits don't redo work (might mean computers with little RAM struggle on large files?):
-        #   _sm_*  : the Gaussian-blurred map, kept until `smoothing` changes
-        #   _layer : this element's colour contribution to the combined image
+        #   _sm_*     : the Gaussian-blurred map, kept until `smoothing` changes
+        #   _layer    : this element's colour contribution to the combined image
+        #   _thumb_rgb: the full thumbnail-scale colour image, re-cropped on
+        #               every ROI change without redoing the processing pipeline
         self._sm_p = self._sm_c = None
         self._sm_p_sigma = self._sm_c_sigma = None
         self._layer = None
+        self._thumb_rgb = None
 
         # title: colour swatch + tinted element name + include/exclude toggle
         self._swatch_on = _hex(element.rgb)
@@ -480,13 +499,23 @@ class ElementWidget(QFrame):
         """Refresh this element's thumbnail, histogram and cached layer."""
         sm_p = self.smoothed_preview()
         gray = tonemap(sm_p, self.black, self.gamma)
-        self.viewer._show(self.thumb, colorize(gray, self.rgb, self.brightness))
+        self._thumb_rgb = colorize(gray, self.rgb, self.brightness)
+        self._render_thumb()
         self.hist.setPixmap(QPixmap.fromImage(
             to_qimage(histogram_image(sm_p, self.black, self.rgb))))
 
         sm_c = self.smoothed_combined()
         gray_c = tonemap(sm_c, self.black, self.gamma)
         self._layer = colorize(gray_c, self.rgb, self.brightness)
+
+    def _render_thumb(self):
+        """Crop the cached thumbnail RGB to the shared ROI and show it."""
+        if self._thumb_rgb is None:
+            return
+        cropped = crop_to_roi(self._thumb_rgb, self.viewer.view_roi)
+        pixmap = QPixmap.fromImage(to_qimage(cropped))
+        self.thumb.setPixmap(pixmap.scaled(
+            self.thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def notify_change(self):
         """A control for this element changed: recompute just this element."""
@@ -584,6 +613,133 @@ def resolve_filenames(image_dir, names):
     return ("alternative", best[3], best[1], best[2])
 
 
+# ---------- GUI: COMBINED VIEW ---------- #
+
+class CombinedView(QLabel):
+    """QLabel that captures wheel + drag and routes them to the viewer's ROI.
+
+    This is the only widget that accepts zoom/pan input. All element thumbnails
+    stay plain QLabels and re-render passively from the shared ROI.
+    """
+
+    def __init__(self, viewer):
+        super().__init__()
+        self.viewer = viewer
+        self._drag_anchor = None  # (cursor_pos, starting_roi, displayed_rect)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def _displayed_rect(self):
+        """Pixel rect inside the label that the pixmap fills.
+        Returns (offset_x, offset_y, drawn_w, drawn_h) or None when no pixmap.
+        """
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return None
+        size = pm.size().scaled(self.size(), Qt.KeepAspectRatio)
+        dw, dh = size.width(), size.height()
+        if dw <= 0 or dh <= 0:
+            return None
+        ox = (self.width() - dw) / 2.0
+        oy = (self.height() - dh) / 2.0
+        return ox, oy, dw, dh
+
+    def _cursor_to_norm(self, pos):
+        """Map a label cursor position to normalised image coords in the full image.
+        Returns None if the cursor is outside the drawn pixmap.
+        """
+        rect = self._displayed_rect()
+        if rect is None:
+            return None
+        ox, oy, dw, dh = rect
+        x = pos.x() - ox
+        y = pos.y() - oy
+        if not (0 <= x <= dw and 0 <= y <= dh):
+            return None
+        fx, fy = x / dw, y / dh
+        x0, y0, x1, y1 = self.viewer.view_roi
+        return x0 + fx * (x1 - x0), y0 + fy * (y1 - y0)
+
+    def _zoom_around(self, anchor_norm, factor):
+        """Shrink/grow the ROI by `factor`, keeping `anchor_norm` fixed on screen."""
+        nx, ny = anchor_norm
+        x0, y0, x1, y1 = self.viewer.view_roi
+        fx = (nx - x0) / (x1 - x0)
+        fy = (ny - y0) / (y1 - y0)
+        new_w = (x1 - x0) * factor
+        new_h = (y1 - y0) * factor
+        new_x0 = nx - fx * new_w
+        new_y0 = ny - fy * new_h
+        self.viewer.set_roi((new_x0, new_y0, new_x0 + new_w, new_y0 + new_h))
+
+    def _pan_pixels(self, dx_px, dy_px):
+        """Shift the ROI by a pixel offset measured in the displayed pixmap."""
+        rect = self._displayed_rect()
+        if rect is None:
+            return
+        _, _, dw, dh = rect
+        x0, y0, x1, y1 = self.viewer.view_roi
+        w, h = x1 - x0, y1 - y0
+        # Content follows the gesture: scrolling/dragging right reveals image to the left.
+        nx0 = x0 - dx_px / dw * w
+        ny0 = y0 - dy_px / dh * h
+        self.viewer.set_roi((nx0, ny0, nx0 + w, ny0 + h))
+
+    def wheelEvent(self, event):
+        # Plain trackpad scroll pans; any modifier (Option/Cmd/Ctrl) makes it zoom.
+        zoom_modifier = event.modifiers() & (
+            Qt.AltModifier | Qt.ControlModifier | Qt.MetaModifier)
+        pixel_delta = event.pixelDelta()
+
+        if not zoom_modifier and not pixel_delta.isNull():
+            self._pan_pixels(pixel_delta.x(), pixel_delta.y())
+            event.accept()
+            return
+
+        # Otherwise zoom: mouse wheel, or modifier-held trackpad scroll.
+        norm = self._cursor_to_norm(event.pos())
+        if norm is None:
+            return
+        delta = event.angleDelta().y() or pixel_delta.y()
+        if delta == 0:
+            return
+        # Smooth: each 120 angle-units (or ~120 px on a trackpad) is one step.
+        factor = ZOOM_STEP ** (-delta / 120.0)
+        self._zoom_around(norm, factor)
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        rect = self._displayed_rect()
+        if rect is None:
+            return
+        ox, oy, dw, dh = rect
+        x = event.pos().x() - ox
+        y = event.pos().y() - oy
+        if not (0 <= x <= dw and 0 <= y <= dh):
+            return
+        self._drag_anchor = (event.pos(), self.viewer.view_roi, rect)
+        self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_anchor is None:
+            return
+        start, start_roi, (ox, oy, dw, dh) = self._drag_anchor
+        x0, y0, x1, y1 = start_roi
+        w, h = x1 - x0, y1 - y0
+        # Dragging the image to the right moves the ROI to the left in image space.
+        dx = -(event.pos().x() - start.x()) / dw * w
+        dy = -(event.pos().y() - start.y()) / dh * h
+        new_x0 = x0 + dx
+        new_y0 = y0 + dy
+        self.viewer.set_roi((new_x0, new_y0, new_x0 + w, new_y0 + h))
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_anchor is not None:
+            self._drag_anchor = None
+            self.setCursor(Qt.OpenHandCursor)
+
+
 # ---------- GUI: MAIN WINDOW ------------ #
 
 class Viewer(QWidget):
@@ -595,7 +751,8 @@ class Viewer(QWidget):
         self.elements = []  # ElementWidget per element
         self.full_data = []  # (full_res_map, rgb) per element
         self.used_elements = []  # names actually found on disk
-        self._combined_pixmap = None
+        self._combined_rgb = None  # float RGB of the full combined image; cropped on render
+        self.view_roi = (0.0, 0.0, 1.0, 1.0)  # shared zoom/pan rectangle
         self._init_ui()
         self._load_data()
 
@@ -635,10 +792,23 @@ class Viewer(QWidget):
         factor_widget.setFixedHeight(TITLE_H)
         factor_widget.setLayout(factor_row)
 
-        self.combined_label = QLabel()
+        self.combined_label = CombinedView(self)
         self.combined_label.setMinimumSize(COMBINED_MIN, COMBINED_MIN)
         self.combined_label.setAlignment(Qt.AlignCenter)
         self.combined_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.combined_label.setToolTip(
+            "Option-scroll/Cmd-scroll to zoom; "
+            "drag or two-finger scroll to pan.")
+
+        reset_view_btn = QPushButton("Reset view")
+        reset_view_btn.setToolTip("Restore the full image in every panel.")
+        reset_view_btn.clicked.connect(self.reset_view)
+        reset_view_row = QHBoxLayout()
+        reset_view_row.setContentsMargins(0, 0, 0, 0)
+        reset_view_row.addStretch(1)
+        reset_view_row.addWidget(reset_view_btn)
+        reset_view_widget = QWidget()
+        reset_view_widget.setLayout(reset_view_row)
 
         combined_card = QFrame()
         combined_card.setObjectName("card")
@@ -649,6 +819,7 @@ class Viewer(QWidget):
         cc_layout.addWidget(combined_title)
         cc_layout.addWidget(factor_widget)
         cc_layout.addWidget(self.combined_label, stretch=1)
+        cc_layout.addWidget(reset_view_widget)
         combined_card.setLayout(cc_layout)
 
         save_btn = QPushButton("Save Full Resolution")
@@ -777,17 +948,43 @@ class Viewer(QWidget):
         self._finalise_size()
         self.update_display()
 
-    def _show(self, label, img):
-        pixmap = QPixmap.fromImage(to_qimage(img))
-        label.setPixmap(pixmap.scaled(
-            label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
     def _render_combined(self):
-        """Scale the cached combined pixmap to fill the current preview area."""
-        if self._combined_pixmap is None:
+        """Crop the cached combined RGB to the current ROI and fill the preview."""
+        if self._combined_rgb is None:
             return
-        self.combined_label.setPixmap(self._combined_pixmap.scaled(
+        cropped = crop_to_roi(self._combined_rgb, self.view_roi)
+        pixmap = QPixmap.fromImage(to_qimage(cropped))
+        self.combined_label.setPixmap(pixmap.scaled(
             self.combined_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _refresh_thumbs(self):
+        """Re-crop every element thumbnail to the current ROI."""
+        for w in self.elements:
+            w._render_thumb()
+
+    def set_roi(self, new_roi):
+        """Set the shared ROI, then re-render every linked view.
+        Clamps width and height to [MIN_ROI_SPAN, 1] and shifts so the box fits
+        inside [0, 1].
+        """
+        x0, y0, x1, y1 = new_roi
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        w = min(1.0, max(MIN_ROI_SPAN, x1 - x0))
+        h = min(1.0, max(MIN_ROI_SPAN, y1 - y0))
+        x0 = max(0.0, min(1.0 - w, x0))
+        y0 = max(0.0, min(1.0 - h, y0))
+        roi = (x0, y0, x0 + w, y0 + h)
+        if roi == self.view_roi:
+            return
+        self.view_roi = roi
+        self._refresh_thumbs()
+        self._render_combined()
+
+    def reset_view(self):
+        self.set_roi((0.0, 0.0, 1.0, 1.0))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -819,7 +1016,7 @@ class Viewer(QWidget):
         else:
             h, w0 = self.elements[0].combined_img.shape[:2]
             combined = np.zeros((h, w0, 3), dtype=np.float32)
-        self._combined_pixmap = QPixmap.fromImage(to_qimage(combined))
+        self._combined_rgb = combined
         self._render_combined()
 
     def _apply_brightness_factor(self):
@@ -883,7 +1080,7 @@ class Viewer(QWidget):
         self._export(combined, str(output_path))
 
     def _write_settings(self, path):
-        """Save every element's processing settings + source dir for reproducibility."""
+        """Save every element's processing settings + source dir (for reproducibility/applying to other images)."""
         elements = {}
         for w in self.elements:
             elements[w.name] = {
