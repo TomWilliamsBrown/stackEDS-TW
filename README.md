@@ -1,10 +1,15 @@
-
-
-https://github.com/user-attachments/assets/f55f4afd-53aa-4756-82e0-032f449981f0
-
 # stackEDS-TW
 
 Stack EDS element maps (TIFF) into a false-colour composite using a GUI.
+
+## Example Usage
+
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/f55f4afd-53aa-4756-82e0-032f449981f0" controls width="720">
+    Your browser does not support the video tag.
+    <a href="https://github.com/user-attachments/assets/f55f4afd-53aa-4756-82e0-032f449981f0">Watch the demo</a>
+  </video>
+</div>
 
 ## Install
 

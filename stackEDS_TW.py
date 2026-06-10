@@ -448,6 +448,7 @@ class ElementWidget(QFrame):
         self.white_c = Control("White level", 0.0, 1.0, element.white, refresh)
         self.gamma_c = Control("Gamma", GAMMA_MIN, GAMMA_MAX, element.gamma, refresh)
         self.smooth_c = Control("Smoothing", 0.0, MAX_SMOOTHING, element.smoothing, refresh, fmt="{:.1f}")
+        self.smooth_c.setToolTip("Gaussian smoothing sigma (in full-resolution pixels). Enter 0 to disable smoothing for this element.")
         self.controls = [self.brightness_c, self.black_c, self.white_c, self.gamma_c, self.smooth_c]
 
         self.reset_btn = QPushButton("Reset")
