@@ -15,7 +15,7 @@ Stack EDS element maps (TIFF) into a false-colour composite using a GUI.
 
 ### 1. Install `uv`
 
-`uv` is a single-binary Python installer; it pulls in the right Python version automatically (https://docs.astral.sh/uv/getting-started/installation/). This step is optional, but it will make things run more smoothly if you don't want to install dependencies manually!
+[`uv`](https://docs.astral.sh/uv/) is a single-binary Python installer; it pulls in the right Python version and other packages automatically. This step is optional, but it will make things run much more smoothly!
 
 - **macOS / Linux**
   ```sh
