@@ -36,7 +36,7 @@ class Element:
     name: str
     colour: str
     brightness: float = 5.0  # gain
-    smoothing: float = 2.0  # Gaussian sigma (full-res pixels)
+    smoothing: float = 0.0  # Gaussian sigma (full-res pixels)
     black: float = 0.0  # black-level threshold, [0, 1]
     white: float = 1.0  # white-level threshold, [0, 1]
     gamma: float = 1.0  # contrast curve
@@ -491,6 +491,13 @@ class MaskSettingsPopup(QFrame):
             "Soft-edge sigma on the final mask. 0 = a hard edge.")
         self.controls = [self.blur_c, self.kernel_c, self.area_c, self.feather_c]
 
+        remask_btn = QPushButton("Remask")
+        remask_btn.setObjectName("primary")
+        remask_btn.setToolTip(
+            "Recompute the sample outline from the current adjusted maps and "
+            "tuning. The mask stays fixed until you click this.")
+        remask_btn.clicked.connect(viewer.remask)
+
         reset_btn = QPushButton("Reset tuning")
         reset_btn.setToolTip("Restore the default mask tuning values.")
         reset_btn.clicked.connect(self._reset)
@@ -502,6 +509,7 @@ class MaskSettingsPopup(QFrame):
         lay.addWidget(hint)
         for c in self.controls:
             lay.addWidget(c)
+        lay.addWidget(remask_btn)
         lay.addWidget(reset_btn)
         self.setLayout(lay)
         self.setFixedWidth(262)
@@ -514,13 +522,11 @@ class MaskSettingsPopup(QFrame):
         self.feather_c.set_value(self.viewer.mask_feather)
 
     def _changed(self):
+        # Tuning values apply on the next Remask; don't recompute the mask now.
         self.viewer.mask_blur = self.blur_c.value()
         self.viewer.mask_kernel = self.kernel_c.value()
         self.viewer.mask_min_area = self.area_c.value()
         self.viewer.mask_feather = self.feather_c.value()
-        if self.viewer.mask_enabled:
-            self.viewer._recompute_masks()
-            self.viewer.refresh_combined()
 
     def _reset(self):
         self.blur_c.set_value(MASK_BLUR_FRAC)
@@ -1038,8 +1044,8 @@ class Viewer(QWidget):
         self.mask_btn.setCheckable(True)
         self.mask_btn.setCursor(Qt.PointingHandCursor)
         self.mask_btn.setToolTip(
-            "Estimate the sample outline from the combined signal of every "
-            "element and hide the noisy background outside it.")
+            "Detect the sample outline from the combined image you've adjusted "
+            "(included elements only) and hide the noisy background outside it.")
         self.mask_btn.toggled.connect(self._on_mask_toggle)
 
         # gear button opens the advanced tuning popup
@@ -1281,9 +1287,8 @@ class Viewer(QWidget):
             w.recompute()
         self.refresh_combined()
 
-    def refresh_combined(self):
-        """Sum the cached colour layers of the included elements and show them.
-        """
+    def _build_combined(self):
+        """Unmasked, clipped sum of the included elements' colour layers."""
         included = [w for w in self.elements if w.included and w.layer() is not None]
         if included:
             combined = included[0].layer().copy()
@@ -1293,10 +1298,30 @@ class Viewer(QWidget):
         else:
             h, w0 = self.elements[0].combined_img.shape[:2]
             combined = np.zeros((h, w0, 3), dtype=np.float32)
+        return combined
+
+    def refresh_combined(self):
+        """Re-apply the (frozen) mask to the current combined image and show it.
+
+        The silhouette itself is only recomputed by remask(); edits here just
+        re-apply the cached mask, so tuning the maps doesn't move the edge.
+        """
+        combined = self._build_combined()
         if self.mask_enabled and self._mask_combined is not None:
-            combined *= self._mask_combined[..., None]
+            combined = combined * self._mask_combined[..., None]
         self._combined_rgb = combined
         self._render_combined()
+
+    def remask(self):
+        """Recompute the silhouette from the current adjusted combined image.
+
+        Triggered only explicitly: the Remask button, enabling the mask, or
+        loading settings with the mask on.
+        """
+        if not self.mask_enabled:
+            return
+        self._mask_combined = self._compute_mask(self._build_combined())
+        self.refresh_combined()
 
     def _apply_brightness_factor(self):
         try:
@@ -1321,14 +1346,15 @@ class Viewer(QWidget):
         self.mask_sens_c.setEnabled(checked)
         self.mask_adv_btn.setEnabled(checked)
         self.mask_btn.setText("Mask background: on" if checked else "Mask background")
-        self._recompute_masks()
-        self.refresh_combined()
+        if checked:
+            self.remask()  # compute the initial silhouette
+        else:
+            self._mask_combined = None
+            self.refresh_combined()
 
     def _on_mask_change(self):
+        # Sensitivity applies on the next Remask; don't recompute the mask now.
         self.mask_sensitivity = self.mask_sens_c.value()
-        if self.mask_enabled:
-            self._recompute_masks()
-            self.refresh_combined()
 
     def _open_mask_settings(self):
         """Pop up the advanced mask-tuning panel under the gear button."""
@@ -1337,17 +1363,18 @@ class Viewer(QWidget):
         self._mask_popup.sync_from_viewer()
         self._mask_popup.popup_under(self.mask_adv_btn)
 
-    def _recompute_masks(self):
-        """Rebuild the combined-scale silhouette from the raw element maps.
-        Uses the maps directly (not the tonemapped layers) so the mask is a
-        property of the measurement, independent of the display sliders.
+    def _compute_mask(self, combined_rgb):
+        """Silhouette from the *adjusted* combined image (what you see).
+
+        Derives the mask from the summed colour layers of the included elements,
+        reduced to a single intensity, so every per-element edit feeds the edge
+        detection: excluding a noisy channel drops it, raising an element's black
+        level removes its noise floor, and brightness rebalances the (otherwise
+        qualitative) per-map scaling.
         """
-        if not self.mask_enabled:
-            self._mask_combined = None
-            return
-        maps = [w.combined_img for w in self.elements if w.available]
-        self._mask_combined = sample_mask(
-            maps, self.mask_sensitivity, self.mask_blur, self.mask_kernel,
+        intensity = combined_rgb.max(axis=2)
+        return sample_mask(
+            [intensity], self.mask_sensitivity, self.mask_blur, self.mask_kernel,
             self.mask_min_area, self.mask_feather)
 
     def reset_all(self):
@@ -1368,8 +1395,8 @@ class Viewer(QWidget):
         self.mask_enabled = False
         self.mask_sens_c.setEnabled(False)
         self.mask_adv_btn.setEnabled(False)
+        self._mask_combined = None
         self.mask_btn.setText("Mask background")
-        self._recompute_masks()
         self.update_display()
 
     @staticmethod
@@ -1508,9 +1535,10 @@ class Viewer(QWidget):
         self.mask_sens_c.setEnabled(mask_on)
         self.mask_adv_btn.setEnabled(mask_on)
         self.mask_btn.setText("Mask background: on" if mask_on else "Mask background")
-        self._recompute_masks()
 
         self.update_display()
+        if self.mask_enabled:
+            self.remask()
 
         notes = []
         src = payload.get("source_dir")
