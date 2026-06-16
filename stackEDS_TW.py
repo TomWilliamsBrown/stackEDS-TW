@@ -36,7 +36,7 @@ class Element:
     name: str
     colour: str
     brightness: float = 5.0  # gain
-    smoothing: float = 2.0  # Gaussian sigma (full-res pixels)
+    smoothing: float = 0.0  # Gaussian sigma (full-res pixels)
     black: float = 0.0  # black-level threshold, [0, 1]
     white: float = 1.0  # white-level threshold, [0, 1]
     gamma: float = 1.0  # contrast curve
@@ -77,16 +77,24 @@ TITLE_H = 22  # px, element/combined title height (kept equal so the
 COMBINED_MIN = 420  # px, minimum side of the (responsive) combined preview
 HIST_W = PREVIEW_SIZE  # px, histogram width
 HIST_H = 20  # px, histogram height
+TUNING_FIELD_W = 96  # px, numeric entry width in the mask-tuning popup
 EXPORT_MAX = 65535  # 16-bit TIFF export range
 
 # adjustable-control ranges
 BRIGHTNESS_MAX = 100.0
 MAX_SMOOTHING = 10.0
 GAMMA_MIN, GAMMA_MAX = 0.2, 5.0
+MASK_SENS_MIN, MASK_SENS_MAX = 0.0, 3.0  # background-mask threshold multiplier
 
 # Zoom/pan: smallest fraction of the image that can fill the view
 MIN_ROI_SPAN = 0.01
 ZOOM_STEP = 1.2
+
+# Background mask:
+MASK_BLUR_FRAC = 0.002      # Gaussian sigma applied before thresholding
+MASK_KERNEL_FRAC = 0.001    # morphological open/close kernel size
+MASK_MIN_AREA_FRAC = 0.0002  # ignore detected blobs smaller than this
+MASK_FEATHER_FRAC = 0.000  # soft-edge sigma on the final mask (0 = hard edge)
 
 # ---------------- THEME ----------------- #
 # This is a Qt Style Sheet. It only restyles widgets; none
@@ -182,6 +190,11 @@ QPushButton#toggle:checked {{
     border: 1px solid {ACCENT};
     color: #dceaff;
 }}
+QPushButton#masktoggle:checked {{
+    background: #1f3a5c;
+    border: 1px solid {ACCENT};
+    color: #dceaff;
+}}
 """
 
 
@@ -270,6 +283,68 @@ def render_layer(src, w, scale):
     return colorize(gray, w.rgb, w.brightness)
 
 
+def sample_mask(maps, sensitivity=1.0, blur_frac=MASK_BLUR_FRAC,
+                kernel_frac=MASK_KERNEL_FRAC, min_area_frac=MASK_MIN_AREA_FRAC,
+                feather_frac=MASK_FEATHER_FRAC):
+    """Estimate a solid sample silhouette from a list of raw element maps.
+
+    Steps: sum -> blur -> Otsu threshold (scaled by `sensitivity`) -> morphology
+    to drop speckle and fill pinholes -> fill the outer contour(s) into a solid
+    silhouette -> feather the edge. Returns a float mask in [0, 1] (1 = sample)
+    the same HxW as the inputs.
+
+    `sensitivity` multiplies the auto threshold: >1 trims more background
+    (tighter mask), <1 keeps more of the sample.
+    """
+    if not maps:
+        return None
+    h, w = maps[0].shape[:2]
+
+    total = np.zeros((h, w), dtype=np.float32)
+    for m in maps:
+        total += m
+    peak = total.max()
+    if peak <= 0:
+        return np.ones((h, w), dtype=np.float32)  # no signal: hide nothing
+    total /= peak
+
+    short = min(h, w)
+    blur = blur_frac * short
+    if blur > 0:
+        total = cv2.GaussianBlur(total, (0, 0), blur)
+
+    u8 = np.clip(total * 255.0, 0, 255).astype(np.uint8)
+    otsu_t, _ = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary = (u8 >= np.clip(otsu_t * sensitivity, 0, 255)).astype(np.uint8)
+
+    # Open then close: remove isolated background specks, then fill small
+    # pinholes inside the sample.
+    k = max(3, int(round(short * kernel_frac)) | 1)  # odd kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    # Fill the outer contours into a solid silhouette (this is the "edges of the
+    # sample, filled in"). RETR_EXTERNAL ignores interior holes so internal
+    # phases/voids don't punch through the mask.
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.ones((h, w), dtype=np.float32)  # threshold cleared everything
+    min_area = min_area_frac * h * w
+    kept = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not kept:
+        kept = [max(contours, key=cv2.contourArea)]  # keep at least the biggest
+
+    solid = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(solid, kept, -1, 255, thickness=cv2.FILLED)
+    mask = solid.astype(np.float32) / 255.0
+
+    feather = feather_frac * short
+    if feather > 0:
+        mask = cv2.GaussianBlur(mask, (0, 0), feather)
+    return mask
+
+
 def histogram_image(gray, black, white, colour=None, bins=64, width=HIST_W, height=HIST_H):
     """Render a log-scaled intensity histogram with black and white markers.
     Bars are tinted with the element's colour (dimmed); the threshold markers
@@ -326,7 +401,7 @@ class Control(QWidget):
     Out-of-range entries snap to the limit.
     """
 
-    def __init__(self, name, vmin, vmax, value, on_change, fmt="{:.3f}"):
+    def __init__(self, name, vmin, vmax, value, on_change, fmt="{:.3f}", box_width=72):
         super().__init__()
         self.name = name
         self.vmin, self.vmax = vmin, vmax
@@ -338,7 +413,7 @@ class Control(QWidget):
         self.label = QLabel(name)
 
         self.box = QLineEdit()
-        self.box.setFixedWidth(72)
+        self.box.setFixedWidth(box_width)
         self.box.setAlignment(Qt.AlignRight)
         self.box.editingFinished.connect(self._changed)
 
@@ -377,6 +452,96 @@ class Control(QWidget):
         self.box.blockSignals(True)
         self.box.setText(self.fmt.format(self._value))
         self.box.blockSignals(False)
+
+
+# ---------- GUI: MASK TUNING POPUP ------ #
+
+class MaskSettingsPopup(QFrame):
+    """A small popup panel holding the background-mask tuning knobs.
+    """
+
+    def __init__(self, viewer):
+        super().__init__(viewer, Qt.Popup)
+        self.setObjectName("card")
+        self.viewer = viewer
+
+        title = QLabel("Mask tuning")
+        title.setStyleSheet(f"color: {TEXT}; font-weight: 600;")
+        hint = QLabel("Values are fractions of the image size.")
+        hint.setWordWrap(True)
+
+        self.blur_c = Control("Pre-blur", 0.0, 0.05, viewer.mask_blur,
+                              self._changed, fmt="{:.5f}", box_width=TUNING_FIELD_W)
+        self.blur_c.setToolTip(
+            "Gaussian sigma applied before thresholding. Higher = smoother, "
+            "more noise-tolerant edges.")
+        self.kernel_c = Control("Cleanup", 0.0, 0.05, viewer.mask_kernel,
+                                self._changed, fmt="{:.5f}", box_width=TUNING_FIELD_W)
+        self.kernel_c.setToolTip(
+            "Open/close kernel size. Higher removes more speckle and fills "
+            "bigger gaps inside the sample.")
+        self.area_c = Control("Min blob", 0.0, 0.05, viewer.mask_min_area,
+                              self._changed, fmt="{:.5f}", box_width=TUNING_FIELD_W)
+        self.area_c.setToolTip(
+            "Ignore detected regions smaller than this fraction of the image "
+            "area. Higher drops larger stray specks.")
+        self.feather_c = Control("Feather", 0.0, 0.02, viewer.mask_feather,
+                                 self._changed, fmt="{:.5f}", box_width=TUNING_FIELD_W)
+        self.feather_c.setToolTip(
+            "Soft-edge sigma on the final mask. 0 = a hard edge.")
+        self.controls = [self.blur_c, self.kernel_c, self.area_c, self.feather_c]
+
+        remask_btn = QPushButton("Remask")
+        remask_btn.setObjectName("primary")
+        remask_btn.setToolTip(
+            "Recompute the sample outline from the current adjusted maps and "
+            "tuning. The mask stays fixed until you click this.")
+        remask_btn.clicked.connect(viewer.remask)
+
+        reset_btn = QPushButton("Reset tuning")
+        reset_btn.setToolTip("Restore the default mask tuning values.")
+        reset_btn.clicked.connect(self._reset)
+
+        lay = QVBoxLayout()
+        lay.setContentsMargins(CARD_PAD, CARD_PAD, CARD_PAD, CARD_PAD)
+        lay.setSpacing(6)
+        lay.addWidget(title)
+        lay.addWidget(hint)
+        for c in self.controls:
+            lay.addWidget(c)
+        lay.addWidget(remask_btn)
+        lay.addWidget(reset_btn)
+        self.setLayout(lay)
+        self.setFixedWidth(262)
+
+    def sync_from_viewer(self):
+        """Refresh the controls from the viewer (e.g. after Load Settings)."""
+        self.blur_c.set_value(self.viewer.mask_blur)
+        self.kernel_c.set_value(self.viewer.mask_kernel)
+        self.area_c.set_value(self.viewer.mask_min_area)
+        self.feather_c.set_value(self.viewer.mask_feather)
+
+    def _changed(self):
+        # Tuning values apply on the next Remask; don't recompute the mask now.
+        self.viewer.mask_blur = self.blur_c.value()
+        self.viewer.mask_kernel = self.kernel_c.value()
+        self.viewer.mask_min_area = self.area_c.value()
+        self.viewer.mask_feather = self.feather_c.value()
+
+    def _reset(self):
+        self.blur_c.set_value(MASK_BLUR_FRAC)
+        self.kernel_c.set_value(MASK_KERNEL_FRAC)
+        self.area_c.set_value(MASK_MIN_AREA_FRAC)
+        self.feather_c.set_value(MASK_FEATHER_FRAC)
+        self._changed()
+
+    def popup_under(self, button):
+        """Show the popup right-aligned just under `button`."""
+        self.adjustSize()
+        corner = button.mapToGlobal(button.rect().bottomRight())
+        corner.setX(corner.x() - self.width())
+        self.move(corner)
+        self.show()
 
 
 # ---------- GUI: PER-ELEMENT PANEL ------ #
@@ -825,6 +990,14 @@ class Viewer(QWidget):
         self.used_elements = []  # names actually found on disk
         self._combined_rgb = None  # float RGB of the full combined image; cropped on render
         self.view_roi = (0.0, 0.0, 1.0, 1.0)  # shared zoom/pan rectangle
+        self.mask_enabled = False  # background mask on/off
+        self.mask_sensitivity = 0.8
+        self.mask_blur = MASK_BLUR_FRAC
+        self.mask_kernel = MASK_KERNEL_FRAC
+        self.mask_min_area = MASK_MIN_AREA_FRAC
+        self.mask_feather = MASK_FEATHER_FRAC
+        self._mask_combined = None  # cached combined-scale silhouette
+        self._mask_popup = None  # lazily created tuning popup
         self._init_ui()
         self._load_data()
 
@@ -864,6 +1037,34 @@ class Viewer(QWidget):
         factor_widget.setFixedHeight(TITLE_H)
         factor_widget.setLayout(factor_row)
 
+        # Background mask: estimate the sample outline from the combined signal
+        # of every element and hide everything outside it.
+        self.mask_btn = QPushButton("Mask background")
+        self.mask_btn.setObjectName("masktoggle")
+        self.mask_btn.setCheckable(True)
+        self.mask_btn.setCursor(Qt.PointingHandCursor)
+        self.mask_btn.setToolTip(
+            "Detect the sample outline from the combined image you've adjusted "
+            "(included elements only) and hide the noisy background outside it.")
+        self.mask_btn.toggled.connect(self._on_mask_toggle)
+
+        # gear button opens the advanced tuning popup
+        self.mask_adv_btn = QPushButton("⚙")
+        self.mask_adv_btn.setObjectName("toggle")
+        self.mask_adv_btn.setFixedSize(28, 28)
+        self.mask_adv_btn.setCursor(Qt.PointingHandCursor)
+        self.mask_adv_btn.setEnabled(False)
+        self.mask_adv_btn.setToolTip("Advanced mask tuning")
+        self.mask_adv_btn.clicked.connect(self._open_mask_settings)
+
+        self.mask_sens_c = Control(
+            "Mask sensitivity", MASK_SENS_MIN, MASK_SENS_MAX, 1.0,
+            self._on_mask_change, fmt="{:.2f}")
+        self.mask_sens_c.setToolTip(
+            "Multiplies the auto-detected threshold. Above 1 trims more "
+            "background (tighter mask); below 1 keeps more of the sample.")
+        self.mask_sens_c.setEnabled(False)
+
         self.combined_label = CombinedView(self)
         self.combined_label.setMinimumSize(COMBINED_MIN, COMBINED_MIN)
         self.combined_label.setAlignment(Qt.AlignCenter)
@@ -890,6 +1091,15 @@ class Viewer(QWidget):
         cc_layout.setSpacing(6)
         cc_layout.addWidget(combined_title)
         cc_layout.addWidget(factor_widget)
+        mask_row = QHBoxLayout()
+        mask_row.setContentsMargins(0, 0, 0, 0)
+        mask_row.setSpacing(6)
+        mask_row.addWidget(self.mask_btn, stretch=1)
+        mask_row.addWidget(self.mask_adv_btn)
+        mask_row_widget = QWidget()
+        mask_row_widget.setLayout(mask_row)
+        cc_layout.addWidget(mask_row_widget)
+        cc_layout.addWidget(self.mask_sens_c)
         cc_layout.addWidget(self.combined_label, stretch=1)
         cc_layout.addWidget(reset_view_widget)
         combined_card.setLayout(cc_layout)
@@ -1077,9 +1287,8 @@ class Viewer(QWidget):
             w.recompute()
         self.refresh_combined()
 
-    def refresh_combined(self):
-        """Sum the cached colour layers of the included elements and show them.
-        """
+    def _build_combined(self):
+        """Unmasked, clipped sum of the included elements' colour layers."""
         included = [w for w in self.elements if w.included and w.layer() is not None]
         if included:
             combined = included[0].layer().copy()
@@ -1089,8 +1298,30 @@ class Viewer(QWidget):
         else:
             h, w0 = self.elements[0].combined_img.shape[:2]
             combined = np.zeros((h, w0, 3), dtype=np.float32)
+        return combined
+
+    def refresh_combined(self):
+        """Re-apply the (frozen) mask to the current combined image and show it.
+
+        The silhouette itself is only recomputed by remask(); edits here just
+        re-apply the cached mask, so tuning the maps doesn't move the edge.
+        """
+        combined = self._build_combined()
+        if self.mask_enabled and self._mask_combined is not None:
+            combined = combined * self._mask_combined[..., None]
         self._combined_rgb = combined
         self._render_combined()
+
+    def remask(self):
+        """Recompute the silhouette from the current adjusted combined image.
+
+        Triggered only explicitly: the Remask button, enabling the mask, or
+        loading settings with the mask on.
+        """
+        if not self.mask_enabled:
+            return
+        self._mask_combined = self._compute_mask(self._build_combined())
+        self.refresh_combined()
 
     def _apply_brightness_factor(self):
         try:
@@ -1110,10 +1341,62 @@ class Viewer(QWidget):
         self.factor_box.setText("1.0")
         self.factor_box.blockSignals(False)
 
+    def _on_mask_toggle(self, checked):
+        self.mask_enabled = checked
+        self.mask_sens_c.setEnabled(checked)
+        self.mask_adv_btn.setEnabled(checked)
+        self.mask_btn.setText("Mask background: on" if checked else "Mask background")
+        if checked:
+            self.remask()  # compute the initial silhouette
+        else:
+            self._mask_combined = None
+            self.refresh_combined()
+
+    def _on_mask_change(self):
+        # Sensitivity applies on the next Remask; don't recompute the mask now.
+        self.mask_sensitivity = self.mask_sens_c.value()
+
+    def _open_mask_settings(self):
+        """Pop up the advanced mask-tuning panel under the gear button."""
+        if self._mask_popup is None:
+            self._mask_popup = MaskSettingsPopup(self)
+        self._mask_popup.sync_from_viewer()
+        self._mask_popup.popup_under(self.mask_adv_btn)
+
+    def _compute_mask(self, combined_rgb):
+        """Silhouette from the *adjusted* combined image (what you see).
+
+        Derives the mask from the summed colour layers of the included elements,
+        reduced to a single intensity, so every per-element edit feeds the edge
+        detection: excluding a noisy channel drops it, raising an element's black
+        level removes its noise floor, and brightness rebalances the (otherwise
+        qualitative) per-map scaling.
+        """
+        intensity = combined_rgb.max(axis=2)
+        return sample_mask(
+            [intensity], self.mask_sensitivity, self.mask_blur, self.mask_kernel,
+            self.mask_min_area, self.mask_feather)
+
     def reset_all(self):
         for w in self.elements:
             for c in w.controls:
                 c.reset()
+        self.mask_sens_c.reset()
+        self.mask_sensitivity = self.mask_sens_c.value()
+        self.mask_blur = MASK_BLUR_FRAC
+        self.mask_kernel = MASK_KERNEL_FRAC
+        self.mask_min_area = MASK_MIN_AREA_FRAC
+        self.mask_feather = MASK_FEATHER_FRAC
+        if self._mask_popup is not None:
+            self._mask_popup.sync_from_viewer()
+        self.mask_btn.blockSignals(True)
+        self.mask_btn.setChecked(False)
+        self.mask_btn.blockSignals(False)
+        self.mask_enabled = False
+        self.mask_sens_c.setEnabled(False)
+        self.mask_adv_btn.setEnabled(False)
+        self._mask_combined = None
+        self.mask_btn.setText("Mask background")
         self.update_display()
 
     @staticmethod
@@ -1129,6 +1412,21 @@ class Viewer(QWidget):
         save_dir = Path(save_dir)
 
         print("Generating full resolution images...")
+        # Use the exact silhouette shown in the preview, scaled up to full
+        # resolution. We deliberately do NOT recompute the mask from the raw
+        # full-res maps: Otsu's threshold and the speckle cleanup both depend on
+        # image statistics, and the full-res data is far noisier than the
+        # downsampled preview, so a fresh full-res mask would diverge from what
+        # was shown on screen.
+        # Nearest-neighbour upscale reuses the exact preview mask values, so a
+        # hard-edged (feather=0) mask stays hard. Use the `feather` knob for a
+        # soft edge instead of relying on interpolation.
+        mask_full = None
+        if self.mask_enabled and self._mask_combined is not None:
+            fh, fw = self.full_data[0][0].shape[:2]
+            mask_full = cv2.resize(self._mask_combined, (fw, fh),
+                                   interpolation=cv2.INTER_NEAREST)
+
         # Each used element's colour map is saved individually. The
         # combined image sums the elements toggled on, and its filename
         # lists the included elements.
@@ -1136,18 +1434,23 @@ class Viewer(QWidget):
         combined_names = []
         for (full, rgb), w in zip(self.full_data, self.elements):
             layer = render_layer(full, w, 1.0)
-            if w.name in self.used_elements:
-                self._export(layer, str(save_dir / f"{w.name}_colour.tif"))
+            # Sum the *unmasked* layers; the mask is applied once after clipping
+            # (below) to mirror the preview's clip -> mask order exactly.
             if w.included and w.name in self.used_elements:
-                combined = layer if combined is None else combined + layer
+                combined = layer.copy() if combined is None else combined + layer
                 combined_names.append(w.name)
+            if w.name in self.used_elements:
+                out_layer = layer if mask_full is None else layer * mask_full[..., None]
+                self._export(out_layer, str(save_dir / f"{w.name}_colour.tif"))
 
         self._write_settings(save_dir / "settings.json")
 
         if combined is None:
             print("No elements are included - skipping combined image.")
             return
-        combined = np.clip(combined, 0, 1)
+        np.clip(combined, 0, 1, out=combined)
+        if mask_full is not None:
+            combined *= mask_full[..., None]
 
         output_path = save_dir / ("_".join(combined_names) + ".tif")
         self._export(combined, str(output_path))
@@ -1168,6 +1471,12 @@ class Viewer(QWidget):
         payload = {
             "schema": 1,
             "source_dir": self.image_dir,
+            "mask_enabled": self.mask_enabled,
+            "mask_sensitivity": self.mask_sensitivity,
+            "mask_blur": self.mask_blur,
+            "mask_kernel": self.mask_kernel,
+            "mask_min_area": self.mask_min_area,
+            "mask_feather": self.mask_feather,
             "elements": elements,
         }
         with open(path, "w") as f:
@@ -1209,7 +1518,27 @@ class Viewer(QWidget):
             w.include_btn.blockSignals(False)
             w._apply_included_style()
 
+        # Restore the global background-mask state
+        mask_on = bool(payload.get("mask_enabled", False))
+        self.mask_sens_c.set_value(float(payload.get("mask_sensitivity", 1.0)))
+        self.mask_sensitivity = self.mask_sens_c.value()
+        self.mask_blur = float(payload.get("mask_blur", MASK_BLUR_FRAC))
+        self.mask_kernel = float(payload.get("mask_kernel", MASK_KERNEL_FRAC))
+        self.mask_min_area = float(payload.get("mask_min_area", MASK_MIN_AREA_FRAC))
+        self.mask_feather = float(payload.get("mask_feather", MASK_FEATHER_FRAC))
+        if self._mask_popup is not None:
+            self._mask_popup.sync_from_viewer()
+        self.mask_btn.blockSignals(True)
+        self.mask_btn.setChecked(mask_on)
+        self.mask_btn.blockSignals(False)
+        self.mask_enabled = mask_on
+        self.mask_sens_c.setEnabled(mask_on)
+        self.mask_adv_btn.setEnabled(mask_on)
+        self.mask_btn.setText("Mask background: on" if mask_on else "Mask background")
+
         self.update_display()
+        if self.mask_enabled:
+            self.remask()
 
         notes = []
         src = payload.get("source_dir")
