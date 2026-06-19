@@ -66,8 +66,12 @@ A folder picker opens - choose a directory containing your `.tif` element maps a
 
 You can point a shortcut to this executable if you don't want to have to open the terminal and prefer to click an icon.
 
-*Currently* it requires the maps to be in the form "[element].tiff", where [element] is fixed as 
-Al, Ca, Cr, Fe, K, Mg, Si, and Ti, although it does give the option for the files to have a consistent prefix/suffix naming pattern. Right now you can only change the elements/naming pattern if you have the editable version, as they are hardcoded.
+*Currently* it requires the maps to be in the form "[element].tiff". On launch a popup asks which kind of map you want to make, picking one of two fixed element sets:
+
+- **Make False-colour Mineral Maps for silicates** — Al, Ca, Cr, Fe, K, Mg, Si, and Ti.
+- **Make Mineral Maps for Zr- and phosphate phases** — Ca, Fe, and P.
+
+It still gives the option for the files to have a consistent prefix/suffix naming pattern. Right now you can only change the element sets/naming pattern if you have the editable version, as they are hardcoded.
 
 ## Update / uninstall
 

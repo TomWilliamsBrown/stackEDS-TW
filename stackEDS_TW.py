@@ -56,15 +56,28 @@ class Element:
 # The file for each element is currently just its chemical symbol, with fixed elements.
 # TODO: Adjust so user can enter their own file format/element without needing to
 # hardcode it or use the current fail fallback.
-ELEMENTS = [
-    Element("Al", "white", brightness=5, smoothing=1),
-    Element("Ca", "yellow", brightness=5, smoothing=1),
-    Element("Cr", "orange", brightness=5, smoothing=1),
-    Element("Fe", "red", brightness=5, smoothing=1),
-    Element("K", "cyan", brightness=5, smoothing=1),
-    Element("Mg", "green", brightness=5, smoothing=1),
-    Element("Si", "blue", brightness=5, smoothing=1),
-    Element("Ti", "magenta", brightness=5, smoothing=1),
+
+SILICATE_ELEMENTS = [
+    Element("Al", "white", brightness=1, smoothing=0),
+    Element("Ca", "yellow", brightness=1, smoothing=0),
+    Element("Cr", "orange", brightness=1, smoothing=0),
+    Element("Fe", "red", brightness=1, smoothing=0),
+    Element("K", "cyan", brightness=1, smoothing=0),
+    Element("Mg", "green", brightness=1, smoothing=0),
+    Element("Si", "blue", brightness=1, smoothing=0),
+    Element("Ti", "magenta", brightness=1, smoothing=0),
+]
+
+# Zr- and phosphate-phase maps.
+PHOSPHATE_ELEMENTS = [
+    Element("Ca", "blue", brightness=1, smoothing=0),
+    Element("Fe", "red", brightness=1, smoothing=0),
+    Element("P", "green", brightness=1, smoothing=0),
+]
+
+ELEMENT_SETS = [
+    ("Make False-colour Mineral Maps for silicates", SILICATE_ELEMENTS),
+    ("Make Mineral Maps for Zr- and phosphate phases", PHOSPHATE_ELEMENTS),
 ]
 
 PREVIEW_SCALE = 0.25  # downsample factor for the per-element thumbnails
@@ -980,11 +993,13 @@ class CombinedView(QLabel):
 # ---------- GUI: MAIN WINDOW ------------ #
 
 class Viewer(QWidget):
-    def __init__(self, image_dir):
+    def __init__(self, image_dir, elements):
         super().__init__()
         self.setObjectName("viewer")
         self.setStyleSheet(STYLESHEET)
         self.image_dir = image_dir
+        self.element_defs = elements  # chosen Element set (silicate or phosphate)
+        self.columns = min(GRID_COLUMNS, len(elements))  # 8 -> 4 (2 rows); 3 -> 3 (1 row)
         self.elements = []  # ElementWidget per element
         self.full_data = []  # (full_res_map, rgb) per element
         self.used_elements = []  # names actually found on disk
@@ -1010,7 +1025,7 @@ class Viewer(QWidget):
 
         # Width hugs the grid so all spare window width
         # goes to growing the combined preview.
-        self._grid_w = GRID_COLUMNS * CARD_WIDTH + (GRID_COLUMNS - 1) * 14
+        self._grid_w = self.columns * CARD_WIDTH + (self.columns - 1) * 14
         self.grid_container = QWidget()
         self.grid_container.setStyleSheet("background: transparent;")
         self.grid_container.setFixedWidth(self._grid_w)
@@ -1149,7 +1164,7 @@ class Viewer(QWidget):
         consistent prefix/suffix pattern is detected, ask the user whether to
         use it instead.
         """
-        names = [el.name for el in ELEMENTS]
+        names = [el.name for el in self.element_defs]
         result = resolve_filenames(self.image_dir, names)
         kind = result[0]
 
@@ -1191,7 +1206,7 @@ class Viewer(QWidget):
         filenames = self._resolve_naming()  # {symbol: filename}; may prompt/raise
         maps = {}
         ref = ref_preview = ref_combined = None
-        for el in ELEMENTS:
+        for el in self.element_defs:
             fname = filenames.get(el.name)
             if not fname:
                 continue
@@ -1208,7 +1223,7 @@ class Viewer(QWidget):
         if ref is None:
             raise RuntimeError("No TIFF files found in directory.")
 
-        for i, el in enumerate(ELEMENTS):
+        for i, el in enumerate(self.element_defs):
             available = el.name in maps
             if available:
                 full, preview, combined = maps[el.name]
@@ -1223,7 +1238,7 @@ class Viewer(QWidget):
                 combined = np.zeros(ref_combined, dtype=np.float32)
 
             widget = ElementWidget(el, preview, combined, self, available=available)
-            self.grid.addWidget(widget, i // GRID_COLUMNS, i % GRID_COLUMNS,
+            self.grid.addWidget(widget, i // self.columns, i % self.columns,
                                 alignment=Qt.AlignTop)
             self.elements.append(widget)
             self.full_data.append((full, el.rgb))
@@ -1554,8 +1569,28 @@ class Viewer(QWidget):
 
 # ---------- RUN ------------------------- #
 
+def _choose_element_set():
+    """Ask which kind of map to make. Returns the chosen Element list, or None
+    if the user closed the dialog without picking.
+    """
+    box = QMessageBox()
+    box.setWindowTitle("Choose map type")
+    box.setText("Which kind of mineral map do you want to make?")
+    buttons = [(box.addButton(label, QMessageBox.AcceptRole), elements)
+               for label, elements in ELEMENT_SETS]
+    box.exec_()
+    clicked = box.clickedButton()
+    return next((elements for btn, elements in buttons if btn is clicked), None)
+
+
 def main():
     app = QApplication(sys.argv)
+
+    # Ask which element set to load before anything else, so the choice persists
+    # across the folder-retry loop below.
+    elements = _choose_element_set()
+    if elements is None:
+        sys.exit(0)  # chooser closed without a choice
 
     # Prompt to select the directory containing the EDS maps
     start = DEFAULT_IMAGE_DIR if DEFAULT_IMAGE_DIR and os.path.isdir(DEFAULT_IMAGE_DIR) \
@@ -1571,7 +1606,7 @@ def main():
         if not image_dir:
             sys.exit(0)  # user cancelled
         try:
-            viewer = Viewer(image_dir)
+            viewer = Viewer(image_dir, elements)
         except RuntimeError as e:
             QMessageBox.warning(None, "No element maps found", str(e))
             start = image_dir
