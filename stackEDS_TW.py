@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 from dataclasses import dataclass
+from skimage.color import rgb2gray
 
 import cv2
 import numpy as np
@@ -233,14 +234,13 @@ def load_and_preprocess(path):
     img = tifffile.imread(path).astype(np.float32)
 
     # EDS element maps should be single-channel. If a TIFF arrives with extra
-    # channels (saved as RGB/RGBA by accident), the channels are hopefully
-    # identical — take channel 0 and flag it so unexpected inputs are visible.
-    # TODO: Test with more image files, add checks for file format.
+    # channels (saved as RGB/RGBA by accident) converts to greyscale.
     if img.ndim == 3:
         if img.shape[2] == 4:
             img = img[:, :, :3]
-        print(f"WARNING: {Path(path).name} is multi-channel; using channel 0.")
-        img = img[:, :, 0]
+        print(f"NOTICE: Converting {Path(path).name} from RGB channels to single grayscale channel")
+        # img = img[:, :, 0]
+        img = rgb2gray(img)
 
     # Safety fallback for unexpected formats
     while img.ndim > 2:
@@ -800,7 +800,7 @@ def resolve_filenames(image_dir, names):
         stem_to_file.setdefault(stem, f)
     default = {name: stem_to_file[name] for name in names if name in stem_to_file}
     if default:
-        return ("default", default)
+        return "default", default
 
     # 2) Otherwise look for a consistent prefix/suffix wrapped around symbols.
     #    Prefix must match exactly across elements. Suffix is normalised so that

@@ -10,6 +10,7 @@ dependencies = [
     "imagecodecs>=2023.0",
     "Pillow>=9.0",
     "PyQt5>=5.15",
+    "scikit-image>=0.24.0",
 ]
 
 [project.scripts]
