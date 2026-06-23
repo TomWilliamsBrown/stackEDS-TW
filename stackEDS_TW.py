@@ -22,11 +22,11 @@ import tifffile
 from PIL import ImageColor
 
 from PyQt5.QtCore import Qt, QTimer, QSettings
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout,
-    QWidget,
+    QApplication, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
 # ---------------- CONFIG ---------------- #
@@ -80,8 +80,8 @@ PHOSPHATE_ELEMENTS = [
 ]
 
 ELEMENT_SETS = [
-    ("Make False-colour Mineral Maps for silicates", SILICATE_ELEMENTS),
-    ("Make Mineral Maps for Zr- and phosphate phases", PHOSPHATE_ELEMENTS),
+    ("silicate", "Make False-colour Mineral Maps for silicates", SILICATE_ELEMENTS),
+    ("phosphate", "Make Mineral Maps for Zr- and phosphate phases", PHOSPHATE_ELEMENTS),
 ]
 
 PREVIEW_SCALE = 0.25  # downsample factor for the per-element thumbnails
@@ -260,6 +260,37 @@ def title_colour(rgb):
         t = max(0.0, min((target - lum) / (1.0 - lum if lum < 1.0 else 1.0), 0.72))
         r, g, b = (c + (1.0 - c) * t for c in (r, g, b))
     return _hex((r, g, b))
+
+
+def parse_colour(value, fallback):
+    """A hex string ('#rrggbb') or CSS/PIL colour name ('red') -> rgb array in [0, 1].
+
+    Returns `fallback` (itself an rgb array) when the value is missing or can't be
+    parsed, so a hand-edited settings file with a typo degrades gracefully.
+    """
+    if not value:
+        return fallback
+    try:
+        return np.array(ImageColor.getrgb(value), dtype=np.float32) / 255.0
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _element_defaults(elements):
+    """Default per-element settings block for an Element list (used to seed a
+    pathway section of settings.json from the hardcoded defaults)."""
+    return {
+        el.name: {
+            "colour": _hex(el.rgb),
+            "brightness": el.brightness,
+            "black": el.black,
+            "white": el.white,
+            "gamma": el.gamma,
+            "smoothing": el.smoothing,
+            "included": True,
+        }
+        for el in elements
+    }
 
 
 # ---------- IMAGE PROCESSING ------------ #
@@ -582,6 +613,18 @@ class MaskSettingsPopup(QFrame):
 
 # ---------- GUI: PER-ELEMENT PANEL ------ #
 
+class Swatch(QLabel):
+    """A small colour chip that runs a callback when left-clicked."""
+    def __init__(self, on_click):
+        super().__init__()
+        self._on_click = on_click
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._on_click is not None:
+            self._on_click()
+
+
 class ElementWidget(QFrame):
     def __init__(self, element, preview_img, combined_img, viewer, available=True):
         super().__init__()
@@ -592,6 +635,7 @@ class ElementWidget(QFrame):
         self.preview_img = preview_img
         self.combined_img = combined_img
         self.rgb = element.rgb
+        self._default_colour = element.colour  # for Reset (restores the hardcoded colour)
         self.available = available
 
         # Caches so edits don't redo work (might mean computers with little RAM struggle on large files?):
@@ -605,11 +649,13 @@ class ElementWidget(QFrame):
         self._thumb_rgb = None
         self._fiji_tmp = None  # temp TIFF currently checked out to Fiji, if any
 
-        # title: colour swatch + tinted element name + include/exclude toggle
+        # title: colour swatch + tinted element name + include/exclude toggle.
+        # Clicking the swatch opens a colour picker for this element.
         self._swatch_on = _hex(element.rgb)
         self._title_on = title_colour(element.rgb)
-        self.swatch = QLabel()
-        self.swatch.setFixedSize(10, 10)
+        self.swatch = Swatch(self._pick_colour)
+        self.swatch.setFixedSize(14, 14)
+        self.swatch.setToolTip("Click to change this element's colour")
         self.name_label = QLabel(element.name)
 
         # top-right toggle: include this element in the combined image (default on)
@@ -838,10 +884,30 @@ class ElementWidget(QFrame):
                 f" color: {muted_text}; border: 1px solid {muted_border};"
                 f" border-radius: 5px; padding: 0; }}")
 
+    def set_colour(self, value):
+        """Apply a new colour (hex or name) to this element: updates the cached
+        rgb plus the swatch/title styling. Does not re-render - the caller does.
+        """
+        self.rgb = parse_colour(value, self.rgb)
+        self._swatch_on = _hex(self.rgb)
+        self._title_on = title_colour(self.rgb)
+        self._apply_included_style()
+
+    def _pick_colour(self):
+        """Open a colour picker for this element (triggered by clicking the swatch)."""
+        if not self.available:
+            return
+        chosen = QColorDialog.getColor(
+            QColor(self._swatch_on), self, f"Colour for {self.name}")
+        if chosen.isValid():
+            self.set_colour(chosen.name())
+            self.notify_change()
+
     def reset(self):
         # Undo any Fiji edit first (back to the map loaded from disk); no-op if
         # this element was never sent to Fiji. notify_change() re-renders.
         self.viewer.restore_original_image(self)
+        self.set_colour(self._default_colour)
         for c in self.controls:
             c.reset()
         self.notify_change()
@@ -1146,12 +1212,20 @@ class CombinedView(QLabel):
 # ---------- GUI: MAIN WINDOW ------------ #
 
 class Viewer(QWidget):
-    def __init__(self, image_dir, elements):
+    def __init__(self, image_dir, elements, pathway_key):
         super().__init__()
         self.setObjectName("viewer")
         self.setStyleSheet(STYLESHEET)
         self.image_dir = image_dir
         self.element_defs = elements  # chosen Element set (silicate or phosphate)
+        self.pathway_key = pathway_key  # which ELEMENT_SETS entry is active
+        # Settings for the pathway(s) that aren't active, preserved across a save so
+        # writing one set's settings.json never clobbers the other's. Seeded from the
+        # hardcoded defaults; replaced by whatever a loaded settings file carries.
+        self.other_pathways = {
+            key: _element_defaults(elems)
+            for key, _, elems in ELEMENT_SETS if key != pathway_key
+        }
         self.columns = min(GRID_COLUMNS, len(elements))  # 8 -> 4 (2 rows); 3 -> 3 (1 row)
         self.elements = []  # ElementWidget per element
         self.full_data = []  # (full_res_map, rgb) per element
@@ -1295,6 +1369,12 @@ class Viewer(QWidget):
         save_btn.setObjectName("primary")
         save_btn.clicked.connect(self.save_full_res)
 
+        save_settings_btn = QPushButton("Save Settings…")
+        save_settings_btn.setToolTip(
+            "Save the colour scheme and processing settings (for both pathways) "
+            "to a settings.json, without exporting images.")
+        save_settings_btn.clicked.connect(self.save_settings)
+
         load_btn = QPushButton("Load Settings")
         load_btn.clicked.connect(self.load_settings)
 
@@ -1306,6 +1386,7 @@ class Viewer(QWidget):
         right.setSpacing(10)
         right.addWidget(combined_card, stretch=1)
         right.addWidget(save_btn)
+        right.addWidget(save_settings_btn)
         right.addWidget(load_btn)
         right.addWidget(reset_btn)
         right_container = QWidget()
@@ -1587,6 +1668,7 @@ class Viewer(QWidget):
     def reset_all(self):
         for w in self.elements:
             self.restore_original_image(w)  # also undo any Fiji edits
+            w.set_colour(w._default_colour)
             for c in w.controls:
                 c.reset()
         self.mask_sens_c.reset()
@@ -1822,11 +1904,10 @@ class Viewer(QWidget):
         output_path = save_dir / ("_".join(combined_names) + ".tif")
         self._export(combined, str(output_path))
 
-    def _write_settings(self, path):
-        """Save every element's processing settings + source dir (for reproducibility/applying to other images)."""
-        elements = {}
-        for w in self.elements:
-            elements[w.name] = {
+    def _current_elements_payload(self):
+        """The active pathway's per-element settings, read from the live widgets."""
+        return {
+            w.name: {
                 "colour": _hex(w.rgb),
                 "brightness": w.brightness,
                 "black": w.black,
@@ -1835,8 +1916,40 @@ class Viewer(QWidget):
                 "smoothing": w.smoothing,
                 "included": w.included,
             }
-        payload = {
-            "schema": 1,
+            for w in self.elements
+        }
+
+    def _write_settings(self, path):
+        """Save both pathways' element settings + the global mask/source state.
+
+        Only the *active* pathway is rebuilt from the live widgets; the other
+        pathway's settings are preserved - taken from an existing file at this
+        path if present, else from the in-memory store - so saving one element
+        set never clobbers the other's settings.
+        """
+        # Start from any settings file already at this path so its other-pathway
+        # block survives even if it was never loaded this session.
+        payload = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    payload = json.load(f)
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        pathways = payload.get("pathways")
+        if not isinstance(pathways, dict):
+            pathways = {}
+        # Seed any missing pathway block from the in-memory store/defaults, then
+        # overwrite only the active pathway with the current widget values.
+        for key, section in self.other_pathways.items():
+            pathways.setdefault(key, section)
+        pathways[self.pathway_key] = self._current_elements_payload()
+
+        payload.update({
+            "schema": 2,
+            "active_pathway": self.pathway_key,
             "source_dir": self.image_dir,
             "mask_enabled": self.mask_enabled,
             "mask_sensitivity": self.mask_sensitivity,
@@ -1844,11 +1957,21 @@ class Viewer(QWidget):
             "mask_kernel": self.mask_kernel,
             "mask_min_area": self.mask_min_area,
             "mask_feather": self.mask_feather,
-            "elements": elements,
-        }
+            "pathways": pathways,
+        })
+        payload.pop("elements", None)  # drop any legacy schema-1 flat block
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"Saved: {path}")
+
+    def save_settings(self):
+        """Write a settings.json (colour scheme + processing) without exporting images."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save settings.json",
+            os.path.join(self.image_dir, "settings.json"), "JSON (*.json)")
+        if not path:
+            return
+        self._write_settings(Path(path))
 
     def load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1858,21 +1981,30 @@ class Viewer(QWidget):
         try:
             with open(path) as f:
                 payload = json.load(f)
-            if payload.get("schema") != 1 or "elements" not in payload:
+            if not isinstance(payload, dict):
+                raise ValueError("Unrecognised settings file.")
+            schema = payload.get("schema")
+            if schema == 2 and isinstance(payload.get("pathways"), dict):
+                pathways = payload["pathways"]
+                loaded = pathways.get(self.pathway_key) or {}
+                # Keep the other pathway(s) in memory so a later save preserves them.
+                for key in self.other_pathways:
+                    if isinstance(pathways.get(key), dict):
+                        self.other_pathways[key] = pathways[key]
+            elif schema == 1 and isinstance(payload.get("elements"), dict):
+                loaded = payload["elements"]  # legacy flat file -> active pathway
+            else:
                 raise ValueError("Unrecognised settings file (schema mismatch).")
         except (OSError, ValueError, json.JSONDecodeError) as e:
             QMessageBox.warning(self, "Could not load settings", str(e))
             return
 
-        loaded = payload["elements"]
-        colour_mismatches = []
         for w in self.elements:
             entry = loaded.get(w.name)
             if entry is None:
                 continue
-            saved_colour = entry.get("colour")
-            if saved_colour and saved_colour.lower() != _hex(w.rgb).lower():
-                colour_mismatches.append(f"{w.name}: {saved_colour} vs {_hex(w.rgb)}")
+            if "colour" in entry:
+                w.set_colour(entry.get("colour"))  # applied even if the map is missing
             if not w.available:
                 continue
             w.brightness_c.set_value(float(entry.get("brightness", w.brightness)))
@@ -1911,9 +2043,6 @@ class Viewer(QWidget):
         src = payload.get("source_dir")
         if src and src != self.image_dir:
             notes.append(f"Settings were saved against a different source folder:\n  {src}")
-        if colour_mismatches:
-            notes.append("Colour assignments differ from current setup:\n  "
-                         + "\n  ".join(colour_mismatches))
         if notes:
             QMessageBox.information(self, "Settings loaded with warnings",
                                     "\n\n".join(notes))
@@ -1922,17 +2051,18 @@ class Viewer(QWidget):
 # ---------- RUN ------------------------- #
 
 def _choose_element_set():
-    """Ask which kind of map to make. Returns the chosen Element list, or None
-    if the user closed the dialog without picking.
+    """Ask which kind of map to make. Returns (pathway_key, Element list), or
+    None if the user closed the dialog without picking.
     """
     box = QMessageBox()
     box.setWindowTitle("Choose map type")
     box.setText("Which kind of mineral map do you want to make?")
-    buttons = [(box.addButton(label, QMessageBox.AcceptRole), elements)
-               for label, elements in ELEMENT_SETS]
+    buttons = [(box.addButton(label, QMessageBox.AcceptRole), key, elements)
+               for key, label, elements in ELEMENT_SETS]
     box.exec_()
     clicked = box.clickedButton()
-    return next((elements for btn, elements in buttons if btn is clicked), None)
+    return next(((key, elements) for btn, key, elements in buttons if btn is clicked),
+                None)
 
 
 def main():
@@ -1940,9 +2070,10 @@ def main():
 
     # Ask which element set to load before anything else, so the choice persists
     # across the folder-retry loop below.
-    elements = _choose_element_set()
-    if elements is None:
+    chosen = _choose_element_set()
+    if chosen is None:
         sys.exit(0)  # chooser closed without a choice
+    pathway_key, elements = chosen
 
     # Prompt to select the directory containing the EDS maps
     start = DEFAULT_IMAGE_DIR if DEFAULT_IMAGE_DIR and os.path.isdir(DEFAULT_IMAGE_DIR) \
@@ -1958,7 +2089,7 @@ def main():
         if not image_dir:
             sys.exit(0)  # user cancelled
         try:
-            viewer = Viewer(image_dir, elements)
+            viewer = Viewer(image_dir, elements, pathway_key)
         except RuntimeError as e:
             QMessageBox.warning(None, "No element maps found", str(e))
             start = image_dir

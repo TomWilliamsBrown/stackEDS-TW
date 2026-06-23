@@ -82,7 +82,7 @@ You can point a shortcut to this executable if you don't want to have to open th
 - **Make False-colour Mineral Maps for silicates** — Al, Ca, Cr, Fe, K, Mg, Si, and Ti.
 - **Make Mineral Maps for Zr- and phosphate phases** — Ca, Fe, and P.
 
-It will attempt to select files with a consistent prefix/suffix naming pattern, and ask you to verify its selection. It uses the colour scheme described in [Joy et al. (2011)](http://www.lpi.usra.edu/meetings/leag2011/pdf/2007.pdf).
+It will attempt to select files with a consistent prefix/suffix naming pattern, and ask you to verify its selection. It uses the colour scheme described in [Joy et al. (2011)](http://www.lpi.usra.edu/meetings/leag2011/pdf/2007.pdf), but you can click on the colour square in each element tile to load a colour picker, or load a colour from a settings.JSON file.
 
 ## Optional: Fiji (ImageJ) Integration:
 
