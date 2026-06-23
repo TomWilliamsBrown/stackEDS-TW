@@ -6,8 +6,12 @@ Each element has an adjustable processing pipeline:
 
 import json
 import os
+import platform
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from skimage.color import rgb2gray
@@ -17,12 +21,12 @@ import numpy as np
 import tifffile
 from PIL import ImageColor
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt, QTimer, QSettings
+from PyQt5.QtGui import QColor, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QSizePolicy, QVBoxLayout,
-    QWidget,
+    QApplication, QColorDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
 # ---------------- CONFIG ---------------- #
@@ -76,8 +80,8 @@ PHOSPHATE_ELEMENTS = [
 ]
 
 ELEMENT_SETS = [
-    ("Make False-colour Mineral Maps for silicates", SILICATE_ELEMENTS),
-    ("Make Mineral Maps for Zr- and phosphate phases", PHOSPHATE_ELEMENTS),
+    ("silicate", "Make False-colour Mineral Maps for silicates", SILICATE_ELEMENTS),
+    ("phosphate", "Make Mineral Maps for Zr- and phosphate phases", PHOSPHATE_ELEMENTS),
 ]
 
 PREVIEW_SCALE = 0.25  # downsample factor for the per-element thumbnails
@@ -89,6 +93,7 @@ CARD_WIDTH = PREVIEW_SIZE + 2 * CARD_PAD  # card hugs the thumbnail width
 TITLE_H = 22  # px, element/combined title height (kept equal so the
 #     big preview's top lines up with the thumbnails)
 COMBINED_MIN = 420  # px, minimum side of the (responsive) combined preview
+SCROLL_GUTTER = 14  # px, width reserved beside the element grid for its scrollbar
 HIST_W = PREVIEW_SIZE  # px, histogram width
 HIST_H = 20  # px, histogram height
 TUNING_FIELD_W = 96  # px, numeric entry width in the mask-tuning popup
@@ -212,6 +217,24 @@ QPushButton#masktoggle:checked {{
 """
 
 
+SCROLL_AREA_QSS = f"""
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 2px 2px 2px 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER_HOVER};
+    border-radius: 5px;
+    min-height: 28px;
+}}
+QScrollBar::handle:vertical:hover {{ background: #4a4f57; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+"""
+
+
 def _hex(rgb):
     """('r','g','b') floats in [0,1] -> '#rrggbb'."""
     return "#%02x%02x%02x" % tuple(int(round(max(0.0, min(1.0, c)) * 255)) for c in rgb)
@@ -237,6 +260,37 @@ def title_colour(rgb):
         t = max(0.0, min((target - lum) / (1.0 - lum if lum < 1.0 else 1.0), 0.72))
         r, g, b = (c + (1.0 - c) * t for c in (r, g, b))
     return _hex((r, g, b))
+
+
+def parse_colour(value, fallback):
+    """A hex string ('#rrggbb') or CSS/PIL colour name ('red') -> rgb array in [0, 1].
+
+    Returns `fallback` (itself an rgb array) when the value is missing or can't be
+    parsed, so a hand-edited settings file with a typo degrades gracefully.
+    """
+    if not value:
+        return fallback
+    try:
+        return np.array(ImageColor.getrgb(value), dtype=np.float32) / 255.0
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _element_defaults(elements):
+    """Default per-element settings block for an Element list (used to seed a
+    pathway section of settings.json from the hardcoded defaults)."""
+    return {
+        el.name: {
+            "colour": _hex(el.rgb),
+            "brightness": el.brightness,
+            "black": el.black,
+            "white": el.white,
+            "gamma": el.gamma,
+            "smoothing": el.smoothing,
+            "included": True,
+        }
+        for el in elements
+    }
 
 
 # ---------- IMAGE PROCESSING ------------ #
@@ -559,6 +613,18 @@ class MaskSettingsPopup(QFrame):
 
 # ---------- GUI: PER-ELEMENT PANEL ------ #
 
+class Swatch(QLabel):
+    """A small colour chip that runs a callback when left-clicked."""
+    def __init__(self, on_click):
+        super().__init__()
+        self._on_click = on_click
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._on_click is not None:
+            self._on_click()
+
+
 class ElementWidget(QFrame):
     def __init__(self, element, preview_img, combined_img, viewer, available=True):
         super().__init__()
@@ -569,6 +635,7 @@ class ElementWidget(QFrame):
         self.preview_img = preview_img
         self.combined_img = combined_img
         self.rgb = element.rgb
+        self._default_colour = element.colour  # for Reset (restores the hardcoded colour)
         self.available = available
 
         # Caches so edits don't redo work (might mean computers with little RAM struggle on large files?):
@@ -580,12 +647,15 @@ class ElementWidget(QFrame):
         self._sm_p_sigma = self._sm_c_sigma = None
         self._layer = None
         self._thumb_rgb = None
+        self._fiji_tmp = None  # temp TIFF currently checked out to Fiji, if any
 
-        # title: colour swatch + tinted element name + include/exclude toggle
+        # title: colour swatch + tinted element name + include/exclude toggle.
+        # Clicking the swatch opens a colour picker for this element.
         self._swatch_on = _hex(element.rgb)
         self._title_on = title_colour(element.rgb)
-        self.swatch = QLabel()
-        self.swatch.setFixedSize(10, 10)
+        self.swatch = Swatch(self._pick_colour)
+        self.swatch.setFixedSize(14, 14)
+        self.swatch.setToolTip("Click to change this element's colour")
         self.name_label = QLabel(element.name)
 
         # top-right toggle: include this element in the combined image (default on)
@@ -629,6 +699,26 @@ class ElementWidget(QFrame):
         self.smooth_c.setToolTip("Gaussian smoothing sigma (in full-resolution pixels). Enter 0 to disable smoothing for this element.")
         self.controls = [self.brightness_c, self.black_c, self.white_c, self.gamma_c, self.smooth_c]
 
+        # Round-trip this element's map through Fiji for manual editing.
+        self.fiji_btn = QPushButton("Edit in Fiji")
+        self.fiji_btn.setToolTip(
+            "Send this element's full-resolution map to Fiji (ImageJ) for "
+            "manual editing, then reload it with ↻.")
+        self.fiji_btn.clicked.connect(lambda: self.viewer.edit_element_in_fiji(self))
+        self.reload_btn = QPushButton("↻")  # clockwise arrow
+        self.reload_btn.setFixedWidth(34)
+        self.reload_btn.setEnabled(False)
+        self.reload_btn.setToolTip(
+            "Reload this map from Fiji after you've edited and saved it.")
+        self.reload_btn.clicked.connect(lambda: self.viewer.reload_element_from_fiji(self))
+        fiji_row = QHBoxLayout()
+        fiji_row.setContentsMargins(0, 0, 0, 0)
+        fiji_row.setSpacing(6)
+        fiji_row.addWidget(self.fiji_btn, stretch=1)
+        fiji_row.addWidget(self.reload_btn)
+        fiji_row_widget = QWidget()
+        fiji_row_widget.setLayout(fiji_row)
+
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.reset)
 
@@ -642,6 +732,7 @@ class ElementWidget(QFrame):
         for c in self.controls:
             layout.addWidget(c)
         layout.addSpacing(2)
+        layout.addWidget(fiji_row_widget)
         layout.addWidget(self.reset_btn)
         self.setLayout(layout)
 
@@ -655,6 +746,8 @@ class ElementWidget(QFrame):
             for c in self.controls:
                 c.setEnabled(False)
             self.reset_btn.setEnabled(False)
+            self.fiji_btn.setEnabled(False)
+            self.reload_btn.setEnabled(False)
             self._apply_included_style()
 
     # current values
@@ -716,6 +809,26 @@ class ElementWidget(QFrame):
         gray_c = tonemap(sm_c, self.black, self.white, self.gamma)
         self._layer = colorize(gray_c, self.rgb, self.brightness)
 
+    def _set_source_maps(self, preview_img, combined_img):
+        """Swap in new source maps and drop the stale caches (no re-render).
+
+        The smoothing caches key only off the sigma value, so they must be
+        cleared explicitly or an unchanged sigma would keep blurring the old
+        image. The current control values (black/white/gamma/brightness) are
+        deliberately preserved and re-applied to the new data.
+        """
+        self.preview_img = preview_img
+        self.combined_img = combined_img
+        self._sm_p = self._sm_c = None
+        self._sm_p_sigma = self._sm_c_sigma = None
+        self._layer = None
+        self._thumb_rgb = None
+
+    def update_source_maps(self, preview_img, combined_img):
+        """Swap in freshly edited maps (e.g. from Fiji) and re-render."""
+        self._set_source_maps(preview_img, combined_img)
+        self.recompute()
+
     def _render_thumb(self):
         """Crop the cached thumbnail RGB to the shared ROI and show it."""
         if self._thumb_rgb is None:
@@ -771,7 +884,30 @@ class ElementWidget(QFrame):
                 f" color: {muted_text}; border: 1px solid {muted_border};"
                 f" border-radius: 5px; padding: 0; }}")
 
+    def set_colour(self, value):
+        """Apply a new colour (hex or name) to this element: updates the cached
+        rgb plus the swatch/title styling. Does not re-render - the caller does.
+        """
+        self.rgb = parse_colour(value, self.rgb)
+        self._swatch_on = _hex(self.rgb)
+        self._title_on = title_colour(self.rgb)
+        self._apply_included_style()
+
+    def _pick_colour(self):
+        """Open a colour picker for this element (triggered by clicking the swatch)."""
+        if not self.available:
+            return
+        chosen = QColorDialog.getColor(
+            QColor(self._swatch_on), self, f"Colour for {self.name}")
+        if chosen.isValid():
+            self.set_colour(chosen.name())
+            self.notify_change()
+
     def reset(self):
+        # Undo any Fiji edit first (back to the map loaded from disk); no-op if
+        # this element was never sent to Fiji. notify_change() re-renders.
+        self.viewer.restore_original_image(self)
+        self.set_colour(self._default_colour)
         for c in self.controls:
             c.reset()
         self.notify_change()
@@ -861,6 +997,89 @@ def _normalise_suffix(suffix):
     s = _TRAILING_NUM_RE.sub("", suffix)
     s = _LINE_LETTER_RE.sub("<line>", s)
     return s
+
+
+# ---------- FIJI (IMAGEJ) HANDOFF ------- #
+#
+# Round-trip a single element's full-res map out to Fiji for manual editing and
+# back into the pipeline. Fiji runs as its own process. THis code writes a temp
+# TIFF, opens it, and re-reads it.
+
+FIJI_PATH_ENV = "FIJI_PATH"        # optional override: full path to the launcher / .app
+FIJI_SETTINGS_ORG = "stackEDS-TW"  # QSettings org/app, used to remember the located Fiji
+
+
+def _fiji_executable_names():
+    """Candidate launcher filenames for the running platform.
+
+    Covers both the modern jaunch-based Fiji (``fiji-<os>-<arch>``) and the
+    legacy ImageJ launcher (``ImageJ-<os>``).
+    """
+    system = platform.system()
+    if system == "Darwin":
+        return ["fiji-macos-arm64", "fiji-macos-x64", "fiji-macos", "ImageJ-macosx"]
+    if system == "Windows":
+        return ["fiji-windows-x64.exe", "fiji-windows-x86.exe", "fiji.exe",
+                "ImageJ-win64.exe", "ImageJ-win32.exe"]
+    return ["fiji-linux-x64", "fiji-linux-x86", "ImageJ-linux64", "ImageJ-linux32", "fiji"]
+
+
+def _fiji_search_roots():
+    """Directories that commonly contain a ``Fiji.app`` install."""
+    home = Path.home()
+    roots = [
+        Path("/Applications"), home / "Applications",
+        home / "Desktop", home / "Downloads", home / "Documents", home,
+        Path("/opt"), Path("/usr/local"),
+    ]
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        val = os.environ.get(var)
+        if val:
+            roots.append(Path(val))
+    roots.append(Path("C:/"))
+    return roots
+
+
+def find_fiji():
+    """Locate the Fiji launcher without prompting. Returns a Path or None.
+
+    Order: ``FIJI_PATH`` env var, a previously remembered choice, a scan of
+    common install locations, then anything named like Fiji on ``PATH``.
+    """
+    override = os.environ.get(FIJI_PATH_ENV)
+    if override and Path(override).exists():
+        return Path(override)
+
+    saved = QSettings(FIJI_SETTINGS_ORG, FIJI_SETTINGS_ORG).value("fiji_path", "")
+    if saved and Path(saved).exists():
+        return Path(saved)
+
+    names = _fiji_executable_names()
+    on_mac = platform.system() == "Darwin"
+    for root in _fiji_search_roots():
+        try:
+            if not root.is_dir():
+                continue
+            # Match both a bare Fiji.app and the common wrapper-folder layout
+            # (e.g. ~/Desktop/Fiji/Fiji.app) one level down, any case.
+            app_dirs = set()
+            for pattern in ("Fiji.app", "[Ff]iji*/Fiji.app"):
+                app_dirs.update(root.glob(pattern))
+        except OSError:
+            continue
+        for app in sorted(app_dirs):
+            launcher_dir = (app / "Contents" / "MacOS") if on_mac else app
+            if launcher_dir.is_dir():
+                for name in names:
+                    candidate = launcher_dir / name
+                    if candidate.exists():
+                        return candidate
+
+    for name in names + ["fiji", "ImageJ"]:
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
 
 
 # ---------- GUI: COMBINED VIEW ---------- #
@@ -993,12 +1212,20 @@ class CombinedView(QLabel):
 # ---------- GUI: MAIN WINDOW ------------ #
 
 class Viewer(QWidget):
-    def __init__(self, image_dir, elements):
+    def __init__(self, image_dir, elements, pathway_key):
         super().__init__()
         self.setObjectName("viewer")
         self.setStyleSheet(STYLESHEET)
         self.image_dir = image_dir
         self.element_defs = elements  # chosen Element set (silicate or phosphate)
+        self.pathway_key = pathway_key  # which ELEMENT_SETS entry is active
+        # Settings for the pathway(s) that aren't active, preserved across a save so
+        # writing one set's settings.json never clobbers the other's. Seeded from the
+        # hardcoded defaults; replaced by whatever a loaded settings file carries.
+        self.other_pathways = {
+            key: _element_defaults(elems)
+            for key, _, elems in ELEMENT_SETS if key != pathway_key
+        }
         self.columns = min(GRID_COLUMNS, len(elements))  # 8 -> 4 (2 rows); 3 -> 3 (1 row)
         self.elements = []  # ElementWidget per element
         self.full_data = []  # (full_res_map, rgb) per element
@@ -1013,6 +1240,11 @@ class Viewer(QWidget):
         self.mask_feather = MASK_FEATHER_FRAC
         self._mask_combined = None  # cached combined-scale silhouette
         self._mask_popup = None  # lazily created tuning popup
+        self._fiji_exe = None  # resolved Fiji launcher (cached after first use)
+        self._fiji_dir = None  # temp dir holding maps checked out to Fiji
+        self._fiji_help_shown = False  # one-time editing-workflow reminder
+        self._fiji_original_full = {}  # idx -> pristine full-res map, kept so Reset
+        #                                can undo a Fiji edit (populated on reload)
         self._init_ui()
         self._load_data()
 
@@ -1030,6 +1262,20 @@ class Viewer(QWidget):
         self.grid_container.setStyleSheet("background: transparent;")
         self.grid_container.setFixedWidth(self._grid_w)
         self.grid_container.setLayout(self.grid)
+
+        # Host tiles in a vertical scroll area that
+        # keeps every tile reachable. Fixed width = grid + scrollbar gutter so
+        # the scrollbar never overlaps the cards.
+        self.grid_scroll = QScrollArea()
+        self.grid_scroll.setWidget(self.grid_container)
+        self.grid_scroll.setWidgetResizable(True)
+        self.grid_scroll.setFrameShape(QFrame.NoFrame)
+        self.grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.grid_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.grid_scroll.setFixedWidth(self._grid_w + SCROLL_GUTTER)
+        self.grid_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.grid_scroll.setStyleSheet(SCROLL_AREA_QSS)
+        self.grid_scroll.viewport().setStyleSheet("background: transparent;")
 
         # --- right: combined preview card (responsive) + actions ---
         combined_title = QLabel("Combined")
@@ -1123,6 +1369,12 @@ class Viewer(QWidget):
         save_btn.setObjectName("primary")
         save_btn.clicked.connect(self.save_full_res)
 
+        save_settings_btn = QPushButton("Save Settings…")
+        save_settings_btn.setToolTip(
+            "Save the colour scheme and processing settings (for both pathways) "
+            "to a settings.json, without exporting images.")
+        save_settings_btn.clicked.connect(self.save_settings)
+
         load_btn = QPushButton("Load Settings")
         load_btn.clicked.connect(self.load_settings)
 
@@ -1134,6 +1386,7 @@ class Viewer(QWidget):
         right.setSpacing(10)
         right.addWidget(combined_card, stretch=1)
         right.addWidget(save_btn)
+        right.addWidget(save_settings_btn)
         right.addWidget(load_btn)
         right.addWidget(reset_btn)
         right_container = QWidget()
@@ -1142,20 +1395,40 @@ class Viewer(QWidget):
         layout = QHBoxLayout()
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(16)
-        layout.addWidget(self.grid_container, stretch=0, alignment=Qt.AlignTop)
+        layout.addWidget(self.grid_scroll, stretch=0)
         layout.addWidget(right_container, stretch=1)
         self.setLayout(layout)
 
         self.setWindowTitle("Element Map Viewer")
 
     def _finalise_size(self):
-        """Size the window so that all cards show at once."""
+        """Size the window to show as many cards as the screen allows.
+
+        Aim to show every tile, but cap the height to the screen's
+        working area and let the grid scroll when it can't fit
+        """
+        # Collect any spare vertical space (window taller than the grid) in an
+        # empty row below the cards, so the rows stay tucked at the top instead
+        # of spreading apart.
+        self.grid.setRowStretch(self.grid.rowCount(), 1)
         self.grid.activate()
-        self.adjustSize()  # fit height to the (tall) grid
-        h = self.height()
-        min_w = self._grid_w + 16 + COMBINED_MIN + 28  # grid + gap + preview + margins
-        self.setMinimumSize(min_w, h)  # never shrink enough to hide a row
-        self.resize(min_w + 220, h)  # a little extra width for the preview
+        self.grid_container.adjustSize()
+
+        min_w = self._grid_w + SCROLL_GUTTER + 16 + COMBINED_MIN + 28  # grid + gutter + gap + preview + margins
+
+        # Height that would show the whole grid at once, including window margins.
+        m = self.layout().contentsMargins()
+        want_h = self.grid_container.sizeHint().height() + m.top() + m.bottom()
+
+        # Never taller than the screen: the grid scrolls to cover any overflow.
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            want_h = min(want_h, screen.availableGeometry().height() - 60)
+
+        # Keep a sensible floor so the combined panel stays usable; Qt still
+        # clamps up to whatever the right-hand column needs as a minimum.
+        self.setMinimumSize(min_w, min(want_h, 540))
+        self.resize(min_w + 220, want_h)  # a little extra width for the preview
 
     def _resolve_naming(self):
         """Pick the on-disk filename for each element.
@@ -1394,6 +1667,8 @@ class Viewer(QWidget):
 
     def reset_all(self):
         for w in self.elements:
+            self.restore_original_image(w)  # also undo any Fiji edits
+            w.set_colour(w._default_colour)
             for c in w.controls:
                 c.reset()
         self.mask_sens_c.reset()
@@ -1414,6 +1689,172 @@ class Viewer(QWidget):
         self.mask_btn.setText("Mask background")
         self.update_display()
 
+    # ---- Fiji (ImageJ) round-trip ---- #
+
+    def _fiji_tmpdir(self):
+        """Session-scoped temp dir for maps handed off to Fiji."""
+        if self._fiji_dir is None or not Path(self._fiji_dir).is_dir():
+            self._fiji_dir = Path(tempfile.mkdtemp(prefix="stackEDS_fiji_"))
+        return Path(self._fiji_dir)
+
+    def _resolve_fiji(self):
+        """Return a usable Fiji launcher Path, prompting + remembering if needed."""
+        if self._fiji_exe is not None and Path(self._fiji_exe).exists():
+            return self._fiji_exe
+        exe = find_fiji() or self._prompt_for_fiji()
+        if exe is not None:
+            self._fiji_exe = exe
+            QSettings(FIJI_SETTINGS_ORG, FIJI_SETTINGS_ORG).setValue("fiji_path", str(exe))
+        return exe
+
+    def _prompt_for_fiji(self):
+        """Ask the user to locate Fiji when auto-detection fails."""
+        QMessageBox.information(
+            self, "Locate Fiji",
+            "Couldn't find Fiji automatically. Please point to your install:\n\n"
+            "  • macOS: choose Fiji.app\n"
+            "  • Windows: choose the launcher inside Fiji.app "
+            "(e.g. fiji-windows-x64.exe)\n"
+            "  • Linux: choose the Fiji launcher\n\n"
+            "Your choice is remembered for next time. You can also set the "
+            f"{FIJI_PATH_ENV} environment variable.")
+        system = platform.system()
+        if system == "Darwin":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Fiji.app", "/Applications", "Application bundle (*.app)")
+        elif system == "Windows":
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select the Fiji launcher", "", "Executables (*.exe)")
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, "Select the Fiji launcher", "")
+        return Path(path) if path else None
+
+    def _launch_fiji(self, exe, image_path):
+        """Open ``image_path`` in Fiji. Returns True on a successful launch."""
+        try:
+            if platform.system() == "Darwin":
+                # Prefer LaunchServices: it reuses a running Fiji and opens the
+                # file via Apple Events. Works whether the user picked the .app
+                # bundle or auto-found the launcher binary inside it.
+                app = next((p for p in [Path(exe), *Path(exe).parents]
+                            if p.suffix == ".app"), None)
+                if app is not None:
+                    result = subprocess.run(
+                        ["open", "-a", str(app), str(image_path)],
+                        capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(result.stderr.strip() or
+                                           "macOS could not open Fiji.")
+                    return True
+            subprocess.Popen([str(exe), str(image_path)])
+            return True
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            QMessageBox.warning(self, "Could not launch Fiji", str(e))
+            # Forget a bad path so the next attempt re-resolves / re-prompts.
+            self._fiji_exe = None
+            QSettings(FIJI_SETTINGS_ORG, FIJI_SETTINGS_ORG).remove("fiji_path")
+            return False
+
+    def edit_element_in_fiji(self, widget):
+        """Write this element's full-res map to a temp TIFF and open it in Fiji."""
+        if not widget.available:
+            return
+        exe = self._resolve_fiji()
+        if exe is None:
+            return
+
+        idx = self.elements.index(widget)
+        full = self.full_data[idx][0]
+        # Distinct from the user's own "<element>.tif" so a stray "Save As" in
+        # Fiji can't be mistaken for (and overwrite) the original map.
+        tmp = self._fiji_tmpdir() / f"{widget.name}__stackEDS_edit.tif"
+        try:
+            # 32-bit float preserves the normalised [0, 1] data exactly; Fiji
+            # (seems to?) open 32-bit TIFFs natively
+            # TODO: is 32 bit best? Need to test.
+            tifffile.imwrite(str(tmp), full.astype(np.float32))
+        except OSError as e:
+            QMessageBox.warning(self, "Could not write temp file", str(e))
+            return
+
+        if not self._fiji_help_shown:
+            QMessageBox.information(
+                self, "Editing in Fiji",
+                "Fiji will open this element's map.\n\n"
+                "1. Edit the image in Fiji.\n"
+                "2. Save it back over the SAME file (File ▸ Save, or "
+                "Ctrl/Cmd+S).\n"
+                "3. Return to here and click ↻ on this card to load the edited version.")
+            self._fiji_help_shown = True
+
+        if self._launch_fiji(exe, tmp):
+            widget._fiji_tmp = tmp
+            widget.reload_btn.setEnabled(True)
+            print(f"Opened '{widget.name}' in Fiji: {tmp}")
+
+    def reload_element_from_fiji(self, widget):
+        """Re-read this element's map after a Fiji edit and rebuild its layers."""
+        tmp = widget._fiji_tmp
+        if tmp is None or not Path(tmp).exists():
+            QMessageBox.information(
+                self, "Nothing to reload",
+                "No edited file found yet. In Fiji, save your changes back over "
+                "the same file first, then click ↻ again.")
+            return
+        try:
+            new_full = load_and_preprocess(str(tmp))
+        except Exception as e:  # noqa: BLE001 - surface any read/decode failure
+            QMessageBox.warning(self, "Could not read edited map", str(e))
+            return
+
+        idx = self.elements.index(widget)
+        rgb = self.full_data[idx][1]
+        h, w0 = self.full_data[idx][0].shape[:2]
+        if new_full.shape[:2] != (h, w0):
+            print(f"NOTICE: '{widget.name}' came back from Fiji at "
+                  f"{new_full.shape[:2]}; resizing to {(h, w0)} to match the "
+                  f"other maps.")
+            new_full = cv2.resize(new_full, (w0, h))
+
+        # Snapshot the pristine (pre-Fiji) map the first time it is overwritted, so
+        # Reset can restore the original. setdefault keeps the true original even
+        # across repeated edit/reload cycles. The stored array is never mutated
+        # in place (the pipeline only ever reads it), so a reference is safe.
+        self._fiji_original_full.setdefault(idx, self.full_data[idx][0])
+        self.full_data[idx] = (new_full, rgb)
+        # Rebuild the downsampled copies at the exact shapes the widget already
+        # uses, so thumbnails/combined stay pixel-aligned with every other map.
+        ph, pw = widget.preview_img.shape[:2]
+        ch, cw = widget.combined_img.shape[:2]
+        widget.update_source_maps(cv2.resize(new_full, (pw, ph)),
+                                  cv2.resize(new_full, (cw, ch)))
+        # Follow the app's frozen-edge rule: re-apply the cached mask rather than
+        # recomputing the silhouette. Use the mask popup's Remask to update it.
+        self.refresh_combined()
+        print(f"Reloaded '{widget.name}' from Fiji.")
+
+    def restore_original_image(self, widget):
+        """Revert a Fiji-edited element to the map originally loaded from disk.
+
+        Returns True if a Fiji edit was undone, False if the element was never
+        edited (then there is nothing to restore). Does not re-render itself —
+        the caller refreshes (e.g. reset()'s notify_change / reset_all's
+        update_display). The Fiji temp file is left intact, so can re-pull the
+        edit if it was reset by mistake.
+        """
+        idx = self.elements.index(widget)
+        orig = self._fiji_original_full.get(idx)
+        if orig is None:
+            return False
+        rgb = self.full_data[idx][1]
+        self.full_data[idx] = (orig, rgb)
+        ph, pw = widget.preview_img.shape[:2]
+        ch, cw = widget.combined_img.shape[:2]
+        widget._set_source_maps(cv2.resize(orig, (pw, ph)),
+                                cv2.resize(orig, (cw, ch)))
+        print(f"Restored '{widget.name}' to its original (pre-Fiji) map.")
+        return True
+
     @staticmethod
     def _export(img, filename):
         tifffile.imwrite(filename, (img * EXPORT_MAX).astype(np.uint16))
@@ -1428,14 +1869,7 @@ class Viewer(QWidget):
 
         print("Generating full resolution images...")
         # Use the exact silhouette shown in the preview, scaled up to full
-        # resolution. We deliberately do NOT recompute the mask from the raw
-        # full-res maps: Otsu's threshold and the speckle cleanup both depend on
-        # image statistics, and the full-res data is far noisier than the
-        # downsampled preview, so a fresh full-res mask would diverge from what
-        # was shown on screen.
-        # Nearest-neighbour upscale reuses the exact preview mask values, so a
-        # hard-edged (feather=0) mask stays hard. Use the `feather` knob for a
-        # soft edge instead of relying on interpolation.
+        # resolution.
         mask_full = None
         if self.mask_enabled and self._mask_combined is not None:
             fh, fw = self.full_data[0][0].shape[:2]
@@ -1470,11 +1904,10 @@ class Viewer(QWidget):
         output_path = save_dir / ("_".join(combined_names) + ".tif")
         self._export(combined, str(output_path))
 
-    def _write_settings(self, path):
-        """Save every element's processing settings + source dir (for reproducibility/applying to other images)."""
-        elements = {}
-        for w in self.elements:
-            elements[w.name] = {
+    def _current_elements_payload(self):
+        """The active pathway's per-element settings, read from the live widgets."""
+        return {
+            w.name: {
                 "colour": _hex(w.rgb),
                 "brightness": w.brightness,
                 "black": w.black,
@@ -1483,8 +1916,40 @@ class Viewer(QWidget):
                 "smoothing": w.smoothing,
                 "included": w.included,
             }
-        payload = {
-            "schema": 1,
+            for w in self.elements
+        }
+
+    def _write_settings(self, path):
+        """Save both pathways' element settings + the global mask/source state.
+
+        Only the *active* pathway is rebuilt from the live widgets; the other
+        pathway's settings are preserved - taken from an existing file at this
+        path if present, else from the in-memory store - so saving one element
+        set never clobbers the other's settings.
+        """
+        # Start from any settings file already at this path so its other-pathway
+        # block survives even if it was never loaded this session.
+        payload = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    payload = json.load(f)
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        pathways = payload.get("pathways")
+        if not isinstance(pathways, dict):
+            pathways = {}
+        # Seed any missing pathway block from the in-memory store/defaults, then
+        # overwrite only the active pathway with the current widget values.
+        for key, section in self.other_pathways.items():
+            pathways.setdefault(key, section)
+        pathways[self.pathway_key] = self._current_elements_payload()
+
+        payload.update({
+            "schema": 2,
+            "active_pathway": self.pathway_key,
             "source_dir": self.image_dir,
             "mask_enabled": self.mask_enabled,
             "mask_sensitivity": self.mask_sensitivity,
@@ -1492,11 +1957,21 @@ class Viewer(QWidget):
             "mask_kernel": self.mask_kernel,
             "mask_min_area": self.mask_min_area,
             "mask_feather": self.mask_feather,
-            "elements": elements,
-        }
+            "pathways": pathways,
+        })
+        payload.pop("elements", None)  # drop any legacy schema-1 flat block
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"Saved: {path}")
+
+    def save_settings(self):
+        """Write a settings.json (colour scheme + processing) without exporting images."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save settings.json",
+            os.path.join(self.image_dir, "settings.json"), "JSON (*.json)")
+        if not path:
+            return
+        self._write_settings(Path(path))
 
     def load_settings(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1506,21 +1981,30 @@ class Viewer(QWidget):
         try:
             with open(path) as f:
                 payload = json.load(f)
-            if payload.get("schema") != 1 or "elements" not in payload:
+            if not isinstance(payload, dict):
+                raise ValueError("Unrecognised settings file.")
+            schema = payload.get("schema")
+            if schema == 2 and isinstance(payload.get("pathways"), dict):
+                pathways = payload["pathways"]
+                loaded = pathways.get(self.pathway_key) or {}
+                # Keep the other pathway(s) in memory so a later save preserves them.
+                for key in self.other_pathways:
+                    if isinstance(pathways.get(key), dict):
+                        self.other_pathways[key] = pathways[key]
+            elif schema == 1 and isinstance(payload.get("elements"), dict):
+                loaded = payload["elements"]  # legacy flat file -> active pathway
+            else:
                 raise ValueError("Unrecognised settings file (schema mismatch).")
         except (OSError, ValueError, json.JSONDecodeError) as e:
             QMessageBox.warning(self, "Could not load settings", str(e))
             return
 
-        loaded = payload["elements"]
-        colour_mismatches = []
         for w in self.elements:
             entry = loaded.get(w.name)
             if entry is None:
                 continue
-            saved_colour = entry.get("colour")
-            if saved_colour and saved_colour.lower() != _hex(w.rgb).lower():
-                colour_mismatches.append(f"{w.name}: {saved_colour} vs {_hex(w.rgb)}")
+            if "colour" in entry:
+                w.set_colour(entry.get("colour"))  # applied even if the map is missing
             if not w.available:
                 continue
             w.brightness_c.set_value(float(entry.get("brightness", w.brightness)))
@@ -1559,9 +2043,6 @@ class Viewer(QWidget):
         src = payload.get("source_dir")
         if src and src != self.image_dir:
             notes.append(f"Settings were saved against a different source folder:\n  {src}")
-        if colour_mismatches:
-            notes.append("Colour assignments differ from current setup:\n  "
-                         + "\n  ".join(colour_mismatches))
         if notes:
             QMessageBox.information(self, "Settings loaded with warnings",
                                     "\n\n".join(notes))
@@ -1570,17 +2051,18 @@ class Viewer(QWidget):
 # ---------- RUN ------------------------- #
 
 def _choose_element_set():
-    """Ask which kind of map to make. Returns the chosen Element list, or None
-    if the user closed the dialog without picking.
+    """Ask which kind of map to make. Returns (pathway_key, Element list), or
+    None if the user closed the dialog without picking.
     """
     box = QMessageBox()
     box.setWindowTitle("Choose map type")
     box.setText("Which kind of mineral map do you want to make?")
-    buttons = [(box.addButton(label, QMessageBox.AcceptRole), elements)
-               for label, elements in ELEMENT_SETS]
+    buttons = [(box.addButton(label, QMessageBox.AcceptRole), key, elements)
+               for key, label, elements in ELEMENT_SETS]
     box.exec_()
     clicked = box.clickedButton()
-    return next((elements for btn, elements in buttons if btn is clicked), None)
+    return next(((key, elements) for btn, key, elements in buttons if btn is clicked),
+                None)
 
 
 def main():
@@ -1588,9 +2070,10 @@ def main():
 
     # Ask which element set to load before anything else, so the choice persists
     # across the folder-retry loop below.
-    elements = _choose_element_set()
-    if elements is None:
+    chosen = _choose_element_set()
+    if chosen is None:
         sys.exit(0)  # chooser closed without a choice
+    pathway_key, elements = chosen
 
     # Prompt to select the directory containing the EDS maps
     start = DEFAULT_IMAGE_DIR if DEFAULT_IMAGE_DIR and os.path.isdir(DEFAULT_IMAGE_DIR) \
@@ -1606,7 +2089,7 @@ def main():
         if not image_dir:
             sys.exit(0)  # user cancelled
         try:
-            viewer = Viewer(image_dir, elements)
+            viewer = Viewer(image_dir, elements, pathway_key)
         except RuntimeError as e:
             QMessageBox.warning(None, "No element maps found", str(e))
             start = image_dir
